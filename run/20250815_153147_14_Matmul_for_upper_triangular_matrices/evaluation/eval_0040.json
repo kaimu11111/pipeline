@@ -1,0 +1,6 @@
+{
+  "runnable": false,
+  "phase": "seed",
+  "error_type": "CompilationError",
+  "message": "unexpected indent (kernel_20250815_154016.py, line 2)"
+}

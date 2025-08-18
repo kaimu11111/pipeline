@@ -1,0 +1,6 @@
+{
+  "runnable": false,
+  "phase": "seed",
+  "error_type": "CompilationError",
+  "message": "/home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/utils/cpp_extension.py:2356: UserWarning: TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. \nIf this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'].\n  warnings.warn(\ndynamic module does not define module export function (PyInit_cuda_mse)"
+}

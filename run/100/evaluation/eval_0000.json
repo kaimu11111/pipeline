@@ -1,0 +1,6 @@
+{
+  "runnable": false,
+  "phase": "seed",
+  "error_type": "CompilationError",
+  "message": "load_inline() got an unexpected keyword argument 'extra_cuda_flags'"
+}
