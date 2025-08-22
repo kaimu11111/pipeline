@@ -1,0 +1,43 @@
+{
+  "avg_speedup": 0.23800498221307645,
+  "accuracy": 0.2,
+  "num_tasks": 5,
+  "tasks": [
+    {
+      "task": "KernelBench/test2/10_ConvTranspose2d_MaxPool_Hardtanh_Mean_Tanh.py",
+      "best_score": 0.0,
+      "best_runnable": false,
+      "task_dir": "/home/wan00559/baseline/run/20250822_140850_batch_first5/10_ConvTranspose2d_MaxPool_Hardtanh_Mean_Tanh",
+      "figure": "/home/wan00559/baseline/run/20250822_140850_batch_first5/10_ConvTranspose2d_MaxPool_Hardtanh_Mean_Tanh/figures/10_ConvTranspose2d_MaxPool_Hardtanh_Mean_Tanh_score.png"
+    },
+    {
+      "task": "KernelBench/test2/6_Conv3d_Softmax_MaxPool_MaxPool.py",
+      "best_score": 0.0,
+      "best_runnable": false,
+      "task_dir": "/home/wan00559/baseline/run/20250822_140850_batch_first5/6_Conv3d_Softmax_MaxPool_MaxPool",
+      "figure": "/home/wan00559/baseline/run/20250822_140850_batch_first5/6_Conv3d_Softmax_MaxPool_MaxPool/figures/6_Conv3d_Softmax_MaxPool_MaxPool_score.png"
+    },
+    {
+      "task": "KernelBench/test2/7_Conv3d_ReLU_LeakyReLU_GELU_Sigmoid_BiasAdd.py",
+      "best_score": 0.0,
+      "best_runnable": false,
+      "task_dir": "/home/wan00559/baseline/run/20250822_140850_batch_first5/7_Conv3d_ReLU_LeakyReLU_GELU_Sigmoid_BiasAdd",
+      "figure": "/home/wan00559/baseline/run/20250822_140850_batch_first5/7_Conv3d_ReLU_LeakyReLU_GELU_Sigmoid_BiasAdd/figures/7_Conv3d_ReLU_LeakyReLU_GELU_Sigmoid_BiasAdd_score.png"
+    },
+    {
+      "task": "KernelBench/test2/8_Conv3d_Divide_Max_GlobalAvgPool_BiasAdd_Sum.py",
+      "best_score": 0.0,
+      "best_runnable": false,
+      "task_dir": "/home/wan00559/baseline/run/20250822_140850_batch_first5/8_Conv3d_Divide_Max_GlobalAvgPool_BiasAdd_Sum",
+      "figure": "/home/wan00559/baseline/run/20250822_140850_batch_first5/8_Conv3d_Divide_Max_GlobalAvgPool_BiasAdd_Sum/figures/8_Conv3d_Divide_Max_GlobalAvgPool_BiasAdd_Sum_score.png"
+    },
+    {
+      "task": "KernelBench/test2/9_Matmul_Subtract_Multiply_ReLU.py",
+      "best_score": 1.1900249110653822,
+      "best_runnable": true,
+      "task_dir": "/home/wan00559/baseline/run/20250822_140850_batch_first5/9_Matmul_Subtract_Multiply_ReLU",
+      "figure": "/home/wan00559/baseline/run/20250822_140850_batch_first5/9_Matmul_Subtract_Multiply_ReLU/figures/9_Matmul_Subtract_Multiply_ReLU_score.png"
+    }
+  ],
+  "timestamp": "2025-08-22 16:12:59"
+}

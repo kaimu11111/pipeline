@@ -1,0 +1,90 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Custom CUDA kernel that fuses bias subtraction and tanh
+source = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cmath>
+
+__global__ void bias_sub_tanh_kernel(const float* __restrict__ x,
+                                     const float* __restrict__ bias,
+                                     float* __restrict__ out,
+                                     int N, int C, int H, int W) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int size = N * C * H * W;
+    if (idx < size) {
+        int n = idx / (C * H * W);
+        int remainder = idx % (C * H * W);
+        int c = remainder / (H * W);
+        remainder = remainder % (H * W);
+        int h = remainder / W;
+        int w = remainder % W;
+
+        float val = x[idx] - bias[c];  // subtract bias for channel c
+        out[idx] = tanhf(val);         // apply tanh
+    }
+}
+
+torch::Tensor bias_sub_tanh_cuda(torch::Tensor x, torch::Tensor bias) {
+    // Expect x shape: [N, C, H, W], bias shape: [C] or [C,1,1]
+    auto N = x.size(0);
+    auto C = x.size(1);
+    auto H = x.size(2);
+    auto W = x.size(3);
+
+    auto out = torch::empty_like(x);
+
+    int size = N * C * H * W;
+    const int block_size = 256;
+    const int grid_size = (size + block_size - 1) / block_size;
+
+    bias_sub_tanh_kernel<<<grid_size, block_size>>>(
+        x.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        out.data_ptr<float>(),
+        N, C, H, W
+    );
+
+    return out;
+}
+"""
+
+cpp_src = r"""
+torch::Tensor bias_sub_tanh_cuda(torch::Tensor x, torch::Tensor bias);
+"""
+
+# Build the fused bias_sub_tanh extension
+bias_sub_tanh = load_inline(
+    name="bias_sub_tanh",
+    cpp_sources=cpp_src,
+    cuda_sources=source,
+    functions=["bias_sub_tanh_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized Model that uses fused custom CUDA kernels for bias subtraction + tanh.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, bias_shape, stride=2, padding=1, output_padding=1):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose2d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            output_padding=output_padding
+        )
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.fused_op = bias_sub_tanh
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        x = self.fused_op.bias_sub_tanh_cuda(x, self.bias)
+        return x

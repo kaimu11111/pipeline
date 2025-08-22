@@ -1,0 +1,197 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Inline CUDA/C++ source for custom operators: add scalar, GELU, and 3D average pooling.
+source = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+// Add a scalar (elementwise)
+__global__ void add_scalar_kernel(const float* __restrict__ inp, float scalar, float* __restrict__ out, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        out[idx] = inp[idx] + scalar;
+    }
+}
+
+torch::Tensor add_scalar_cuda(torch::Tensor input, float scalar) {
+    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
+    auto size = input.numel();
+    auto out = torch::empty_like(input);
+
+    const int block_size = 256;
+    const int grid_size = (size + block_size - 1) / block_size;
+
+    add_scalar_kernel<<<grid_size, block_size>>>(input.data_ptr<float>(), scalar, out.data_ptr<float>(), size);
+    return out;
+}
+
+// Approximate GELU
+__device__ __forceinline__ float gelu_fn(float x) {
+    // Using the standard approximation of GELU
+    float cdf = 0.5f * (1.0f + erff(x * 0.70710678f));
+    return x * cdf;
+}
+
+__global__ void gelu_kernel(const float* __restrict__ inp, float* __restrict__ out, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        out[idx] = gelu_fn(inp[idx]);
+    }
+}
+
+torch::Tensor gelu_cuda(torch::Tensor input) {
+    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
+    auto size = input.numel();
+    auto out = torch::empty_like(input);
+
+    const int block_size = 256;
+    const int grid_size = (size + block_size - 1) / block_size;
+
+    gelu_kernel<<<grid_size, block_size>>>(input.data_ptr<float>(), out.data_ptr<float>(), size);
+    return out;
+}
+
+// 3D average pooling (naive). Expects input shape: [N, C, D, H, W], pool size kD x kH x kW (no overlap).
+__global__ void avg_pool3d_kernel(
+    const float* __restrict__ inp, 
+    float* __restrict__ out,
+    int N, int C, int D, int H, int W,
+    int kD, int kH, int kW) 
+{
+    // Compute output dimensions
+    int Dout = D / kD;
+    int Hout = H / kH;
+    int Wout = W / kW;
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_out_elements = N * C * Dout * Hout * Wout;
+    if (idx >= total_out_elements) return;
+
+    // Decompose idx into N, C, D', H', W'
+    int wout = idx % Wout;
+    int tmp = idx / Wout;
+    int hout = tmp % Hout;
+    tmp /= Hout;
+    int dout = tmp % Dout;
+    tmp /= Dout;
+    int c = tmp % C;
+    int n = tmp / C;
+
+    // Sum region
+    int d_start = dout * kD;
+    int h_start = hout * kH;
+    int w_start = wout * kW;
+    float sum_val = 0.0f;
+    for(int kd = 0; kd < kD; kd++){
+        for(int kh = 0; kh < kH; kh++){
+            for(int kw = 0; kw < kW; kw++){
+                int id = ((n * C + c) * D + (d_start + kd)) * H * W
+                         + (h_start + kh) * W
+                         + (w_start + kw);
+                sum_val += inp[id];
+            }
+        }
+    }
+    out[idx] = sum_val / float(kD * kH * kW);
+}
+
+torch::Tensor avg_pool3d_cuda(torch::Tensor input, int kD, int kH, int kW) {
+    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
+    TORCH_CHECK(input.dim() == 5, "input must have 5 dimensions [N, C, D, H, W]");
+    
+    int N = input.size(0);
+    int C = input.size(1);
+    int D = input.size(2);
+    int H = input.size(3);
+    int W = input.size(4);
+
+    int Dout = D / kD;
+    int Hout = H / kH;
+    int Wout = W / kW;
+
+    // Allocate output
+    auto out_sizes = std::vector<int64_t>{N, C, Dout, Hout, Wout};
+    auto out = torch::empty(out_sizes, input.options());
+
+    int total_out_elements = N * C * Dout * Hout * Wout;
+    const int block_size = 256;
+    const int grid_size = (total_out_elements + block_size - 1) / block_size;
+
+    avg_pool3d_kernel<<<grid_size, block_size>>>(
+        input.data_ptr<float>(), 
+        out.data_ptr<float>(), 
+        N, C, D, H, W, kD, kH, kW
+    );
+    return out;
+}
+""";
+
+// Declarations of the above functions for PyTorch
+cpp_src = r"""
+torch::Tensor add_scalar_cuda(torch::Tensor input, float scalar);
+torch::Tensor gelu_cuda(torch::Tensor input);
+torch::Tensor avg_pool3d_cuda(torch::Tensor input, int kD, int kH, int kW);
+""";
+
+// Compile and load
+fused_ops = load_inline(
+    name="fused_ops",
+    cpp_sources=cpp_src,
+    cuda_sources=source,
+    verbose=False,
+    functions=["add_scalar_cuda", "gelu_cuda", "avg_pool3d_cuda"],
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized Model that performs a 3D transposed convolution, adds a scalar, layer norm,
+    custom avgpool, and custom GELU.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding,
+                 sum_weight, norm_shape, pool_kernel_size):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(
+            in_channels, out_channels, kernel_size,
+            stride=stride, padding=padding, output_padding=output_padding
+        )
+        # Register sum_weight as a parameter
+        self.sum_weight = nn.Parameter(torch.tensor(sum_weight, dtype=torch.float32))
+        self.norm = nn.LayerNorm(norm_shape)
+        self.pool_kernel_size = pool_kernel_size
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        # Custom add
+        x = fused_ops.add_scalar_cuda(x, float(self.sum_weight.item()))
+        x = self.norm(x)
+        # Custom average pooling
+        kD, kH, kW = self.pool_kernel_size
+        x = fused_ops.avg_pool3d_cuda(x, kD, kH, kW)
+        # Custom GELU
+        x = fused_ops.gelu_cuda(x)
+        return x
+
+batch_size = 32
+in_channels = 32
+out_channels = 64
+depth, height, width = 16, 32, 32
+kernel_size = (3, 3, 3)
+stride = (2, 2, 2)
+padding = (1, 1, 1)
+output_padding = (1, 1, 1)
+sum_weight = 1.0
+norm_shape = (out_channels,)
+pool_kernel_size = (2, 2, 2)
+
+def get_inputs():
+    # same as original
+    return [torch.rand(batch_size, in_channels, depth, height, width, device="cuda")]
+
+def get_init_inputs():
+    # same as original
+    return [in_channels, out_channels, kernel_size, stride, padding, output_padding, sum_weight, norm_shape, pool_kernel_size]
+```

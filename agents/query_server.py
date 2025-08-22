@@ -22,9 +22,9 @@ def query_server(
     server_address: str = "localhost",
     server_type: str = "sglang",
     model_name: str = "default",
-    is_reasoning_model: bool = False,
+    is_reasoning_model: bool = True,
     budget_tokens: int = 0,
-    reasoning_effort: str = None,
+    reasoning_effort: str = "medium",
 ):
     match server_type:
         case "local":

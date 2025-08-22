@@ -36,14 +36,41 @@ FEWSHOT_NEW = ROOT / "prompts/few_shot/model_new_ex_add.py"  # optimised ModelNe
 # ---------------------------------------------------------------------------
 # Prompt template (with diversity requirement)
 # ---------------------------------------------------------------------------
+test = Template(
+    dedent(
+        """ 
+You write custom CUDA kernels to replace the pytorch operators in the given architecture 
+to get speedups.You have complete freedom to choose the set of operators you want to replace. You may
+make the decision to replace some operators with custom CUDA kernels and leave others
+unchanged. You may replace multiple operators with custom implementations, consider
+operator fusion opportunities (combining multiple operators into a single kernel, for
+example, combining matmul+relu), or algorithmic changes (such as online softmax). You are
+only limited by your imagination.
 
+Here\’s an example to show you the syntax of inline embedding custom CUDA operators in torch: 
+The example given architecture is:
+‘‘‘
+$few_base
+‘‘‘
+The example new arch with custom CUDA kernels looks like this:
+‘‘‘
+$few_new
+‘‘‘
+
+You are given the following architecture:
+```python
+$arch_src
+```
+Optimize the architecture named Model with custom CUDA operators! Name your optimized
+output architecture ModelNew. Output the new code in codeblocks. Please generate real
+code, NOT pseudocode, make sure the code compiles and is fully functional. Just output
+the new model code, no other text, and NO testing code!
+"""
+    )
+)
 TEMPLATE = Template(
     dedent(
         """
-You are a CUDA‑kernel optimisation specialist.
-Target GPU: **NVIDIA $gpu_name ($gpu_arch)**
-$gpu_items
-
 Task
 ----
 Generate **hand‑written CUDA kernels** that replace *all* PyTorch operator(s)
@@ -52,17 +79,15 @@ operators into a single kernel if that yields better performance.  Leave any
 non‑replaced parts of the model unchanged.
 
 OUTPUT RULES (STRICT) ────────────────────────────────────────────────
-1. Reply with **one—and only one—fenced Python block**.  No prose.
-2. The block must be directly runnable:
-       python model_new.py
-3. Inside the block, follow **exactly** this order:
+1. Inside the block, follow **exactly** this order:
    1. Imports – `torch`, `torch.nn`, `load_inline`.
    2. `source` – triple‑quoted CUDA string(s) (kernel + host wrapper).
    3. `cpp_src` – prototypes for *all* kernels you expose.
    4. **One** `load_inline` call per kernel group.
    5. `class ModelNew(nn.Module)` – mirrors original inputs/outputs but calls
       your CUDA kernels.
-4. **Do NOT include** testing code, `if __name__ == "__main__"`, or extra prose.
+2. **Do NOT include** testing code, `if __name__ == "__main__"`, or extra prose.
+
 
 Few‑shot example (reference only – do **not** echo):
 **Original**
@@ -78,13 +103,13 @@ Target architecture (to optimise):
 ```python
 $arch_src
 ```
-Now output **only** the complete, runnable `ModelNew` script that satisfies
-**ALL OUTPUT RULES (STRICT)** above.
-# ==========================================================
-# OUTPUT FORMAT – copy verbatim
-Return **exactly one** fenced block labelled `python`.  No text before or after.
-Use this skeleton (the model must fill it):
 
+Optimize the architecture named Model with custom CUDA operators! Name your optimized
+output architecture ModelNew. Output the new code in codeblocks. Please generate real
+code, NOT pseudocode, make sure the code compiles and is fully functional. Just output
+the new model code, no other text, and NO testing code!
+
+Example:
 ```python
 # <complete ModelNew code>
 ```
@@ -97,12 +122,6 @@ You are a senior CUDA-kernel optimisation specialist. Your job is to generate a 
 compilable, and runnable Python script that builds and launches **hand-written CUDA kernels**.
 
 
-IMPORTANT:
-Do not think too much. Think a little then give the one—fenced Python block.
-The output must be exactly one fenced code block starting with ```python and ending with ```.
-```python
-# <complete ModelNew code>
-```
 """
 # ---------------------------------------------------------------------------
 # GPU spec loader
@@ -154,10 +173,7 @@ def build_seed_prompt(
     few_new = FEWSHOT_NEW.read_text().strip()
     arch_src = Path(arch_path).read_text().strip()
 
-    return TEMPLATE.substitute(
-        gpu_name=gpu_name,
-        gpu_arch=gpu_arch,
-        gpu_items=gpu_items,
+    return test.substitute(
         few_base=few_base,
         few_new=few_new,
         arch_src=arch_src,

@@ -1,0 +1,6 @@
+{
+  "runnable": false,
+  "phase": "repair",
+  "error_type": "RuntimeError",
+  "message": "Traceback (most recent call last):\n  File \"/home/wan00559/baseline/utils/compile_and_run.py\", line 220, in compare_and_bench\n    test_model = ModelNew(*init_args, **init_kwargs)\n                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/wan00559/baseline/run/20250822_140328_batch_first5/12_Gemm_Multiply_LeakyReLU/code/kernel_20250822_144215.py\", line 115, in __init__\n    nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))\n                                            ^^^^\nNameError: name 'math' is not defined\n"
+}

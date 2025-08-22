@@ -12,7 +12,7 @@ from prompts.generate_custom_cuda import build_seed_prompt, system_prompt
 from utils.compile_and_run import compare_and_bench
 from utils.kernel_io import extract_code_block, save_kernel_code
 from scripts.individual import KernelIndividual  # 按你的实际路径调整
-from prompts.error import COMPILE_ERROR
+from prompts.error import build_error_prompt
 from prompts.optimization import build_optimization_prompt
 
 
@@ -219,9 +219,10 @@ def main():
             # -------- 修复（内联 _attempt）--------
             print("[Repair] start repairing")
             error_log = _last_n_lines(getattr(current_kernel, "metrics", {}).get("message", ""))
-            repair_prompt = COMPILE_ERROR.substitute(
-                OLD_CODE=current_kernel.code,  # type: ignore[union-attr]
-                ERROR_LOG=error_log,
+            repair_prompt = build_error_prompt(
+                old_code=current_kernel.code,
+                error_log=error_log,
+                gpu_name=args.gpu,
             )
 
             ind = _llm_to_kernel(repair_prompt, kernel_dir, call_llm)

@@ -1,0 +1,43 @@
+{
+  "avg_speedup": 0.0,
+  "accuracy": 0.0,
+  "num_tasks": 5,
+  "tasks": [
+    {
+      "task": "KernelBench/test3/11_ConvTranspose2d_BatchNorm_Tanh_MaxPool_GroupNorm.py",
+      "best_score": 0.0,
+      "best_runnable": false,
+      "task_dir": "/home/wan00559/baseline/run/20250822_140328_batch_first5/11_ConvTranspose2d_BatchNorm_Tanh_MaxPool_GroupNorm",
+      "figure": "/home/wan00559/baseline/run/20250822_140328_batch_first5/11_ConvTranspose2d_BatchNorm_Tanh_MaxPool_GroupNorm/figures/11_ConvTranspose2d_BatchNorm_Tanh_MaxPool_GroupNorm_score.png"
+    },
+    {
+      "task": "KernelBench/test3/12_Gemm_Multiply_LeakyReLU.py",
+      "best_score": 0.0,
+      "best_runnable": false,
+      "task_dir": "/home/wan00559/baseline/run/20250822_140328_batch_first5/12_Gemm_Multiply_LeakyReLU",
+      "figure": "/home/wan00559/baseline/run/20250822_140328_batch_first5/12_Gemm_Multiply_LeakyReLU/figures/12_Gemm_Multiply_LeakyReLU_score.png"
+    },
+    {
+      "task": "KernelBench/test3/13_ConvTranspose3d_Mean_Add_Softmax_Tanh_Scaling.py",
+      "best_score": 0.0,
+      "best_runnable": false,
+      "task_dir": "/home/wan00559/baseline/run/20250822_140328_batch_first5/13_ConvTranspose3d_Mean_Add_Softmax_Tanh_Scaling",
+      "figure": "/home/wan00559/baseline/run/20250822_140328_batch_first5/13_ConvTranspose3d_Mean_Add_Softmax_Tanh_Scaling/figures/13_ConvTranspose3d_Mean_Add_Softmax_Tanh_Scaling_score.png"
+    },
+    {
+      "task": "KernelBench/test3/14_Gemm_Divide_Sum_Scaling.py",
+      "best_score": 0.0,
+      "best_runnable": false,
+      "task_dir": "/home/wan00559/baseline/run/20250822_140328_batch_first5/14_Gemm_Divide_Sum_Scaling",
+      "figure": "/home/wan00559/baseline/run/20250822_140328_batch_first5/14_Gemm_Divide_Sum_Scaling/figures/14_Gemm_Divide_Sum_Scaling_score.png"
+    },
+    {
+      "task": "KernelBench/test3/15_ConvTranspose3d_BatchNorm_Subtract.py",
+      "best_score": 0.0,
+      "best_runnable": false,
+      "task_dir": "/home/wan00559/baseline/run/20250822_140328_batch_first5/15_ConvTranspose3d_BatchNorm_Subtract",
+      "figure": "/home/wan00559/baseline/run/20250822_140328_batch_first5/15_ConvTranspose3d_BatchNorm_Subtract/figures/15_ConvTranspose3d_BatchNorm_Subtract_score.png"
+    }
+  ],
+  "timestamp": "2025-08-22 16:09:04"
+}

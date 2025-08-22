@@ -1,0 +1,195 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Inline CUDA/C++ source for custom GELU and GroupNorm kernels
+cuda_src = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+// -----------------------------------------
+// GELU kernel
+// -----------------------------------------
+__global__ void gelu_kernel(const float* __restrict__ input, float* __restrict__ output, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        float x = input[idx];
+        // 1 / sqrt(2)
+        float c = 0.707106781186547524401f;
+        // 0.5 * x * (1 + erf(x / sqrt(2)))
+        output[idx] = 0.5f * x * (1.0f + erff(x * c));
+    }
+}
+
+torch::Tensor gelu_cuda(torch::Tensor input) {
+    auto output = torch::empty_like(input);
+    int size = input.numel();
+    const int threads = 256;
+    const int blocks = (size + threads - 1) / threads;
+    gelu_kernel<<<blocks, threads>>>(input.data_ptr<float>(), output.data_ptr<float>(), size);
+    return output;
+}
+
+// -----------------------------------------
+// GroupNorm kernels
+// -----------------------------------------
+
+// 1) Compute mean and variance per group
+__global__ void group_norm_stats_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ mean,
+    float* __restrict__ var,
+    int N, int C, int H, int W, int G
+) {
+    // Each block is responsible for one sample (n), each thread for one group (g).
+    int n = blockIdx.x;
+    int g = threadIdx.x;
+    if (g < G) {
+        int group_size = C / G;
+        int c_start = g * group_size;
+        int c_end   = c_start + group_size;
+        int spatial_size = H * W;
+        int total_count = group_size * spatial_size;
+
+        float sum_val = 0.0f;
+        float sum_sq = 0.0f;
+
+        // Accumulate values
+        for (int c = c_start; c < c_end; c++) {
+            int offset_c = (n * C + c) * H * W;
+            for (int i = 0; i < spatial_size; i++) {
+                float val = input[offset_c + i];
+                sum_val += val;
+                sum_sq += val * val;
+            }
+        }
+        float m = sum_val / total_count;
+        float v = sum_sq / total_count - m * m;
+        mean[n * G + g] = m;
+        var[n * G + g]  = v;
+    }
+}
+
+// 2) Apply normalization
+__global__ void group_norm_apply_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    const float* __restrict__ mean,
+    const float* __restrict__ var,
+    const float* __restrict__ weight,
+    const float* __restrict__ bias,
+    float eps,
+    int N, int C, int H, int W, int G
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_size = N * C * H * W;
+    if (idx < total_size) {
+        int n  = idx / (C * H * W);
+        int c  = (idx / (H * W)) % C;
+        int hw = idx % (H * W);
+        
+        int group_size = C / G;
+        int g = c / group_size;
+        
+        float m       = mean[n * G + g];
+        float v       = var[n * G + g];
+        float inv_std = rsqrtf(v + eps);
+
+        float w = weight[c];
+        float b = bias[c];
+
+        float val = input[idx];
+        val = (val - m) * inv_std;
+        val = val * w + b;
+        output[idx] = val;
+    }
+}
+
+torch::Tensor group_norm_cuda(
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    int G,
+    float eps
+) {
+    auto N = input.size(0);
+    auto C = input.size(1);
+    auto H = input.size(2);
+    auto W = input.size(3);
+
+    auto output = torch::empty_like(input);
+    auto mean = torch::empty({N * G}, input.options());
+    auto var  = torch::empty({N * G}, input.options());
+
+    // 1) launch stats kernel
+    dim3 blocks_stats(N);
+    dim3 threads_stats(G);
+    group_norm_stats_kernel<<<blocks_stats, threads_stats>>>(
+        input.data_ptr<float>(),
+        mean.data_ptr<float>(),
+        var.data_ptr<float>(),
+        N, C, H, W, G
+    );
+
+    // 2) launch apply kernel
+    int total_size = N * C * H * W;
+    const int threads = 256;
+    const int blocks = (total_size + threads - 1) / threads;
+    group_norm_apply_kernel<<<blocks, threads>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        mean.data_ptr<float>(),
+        var.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        eps,
+        N, C, H, W, G
+    );
+
+    return output;
+}
+"""
+
+cpp_src = r"""
+torch::Tensor gelu_cuda(torch::Tensor input);
+torch::Tensor group_norm_cuda(torch::Tensor input,
+                              torch::Tensor weight,
+                              torch::Tensor bias,
+                              int G,
+                              float eps);
+"""
+
+# Build the extension
+custom_ops = load_inline(
+    name="custom_ops",
+    cpp_sources=cpp_src,
+    cuda_sources=cuda_src,
+    extra_cflags=["-O3"],
+    extra_cuda_cflags=["-O3"],
+    verbose=False,
+    functions=["gelu_cuda", "group_norm_cuda"],
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that uses a standard ConvTranspose2d but replaces GELU and GroupNorm
+    with custom CUDA kernels for speedup.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, groups, num_groups):
+        super(ModelNew, self).__init__()
+        # Keep the same ConvTranspose2d from PyTorch
+        self.conv_transpose = nn.ConvTranspose2d(in_channels, out_channels, kernel_size, stride=stride)
+        # Create GroupNorm just to hold parameters (weight, bias)
+        self.group_norm = nn.GroupNorm(num_groups=num_groups, num_channels=out_channels)
+
+    def forward(self, x):
+        # Standard transposed convolution from PyTorch
+        x = self.conv_transpose(x)
+        # Replace PyTorch's gelu with our custom kernel
+        x = custom_ops.gelu_cuda(x)
+        # Replace PyTorch's group norm with our custom kernel (uses GN's parameters)
+        weight = self.group_norm.weight
+        bias   = self.group_norm.bias
+        x = custom_ops.group_norm_cuda(x, weight, bias, self.group_norm.num_groups, 1e-5)
+        return x

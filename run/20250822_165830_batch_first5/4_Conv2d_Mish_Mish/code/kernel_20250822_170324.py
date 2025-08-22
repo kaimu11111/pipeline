@@ -1,0 +1,78 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+source = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+// This kernel applies Mish twice: out = mish(mish(in))
+__global__ void double_mish_kernel(const float* __restrict__ in, float* __restrict__ out, int size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        float val = in[idx];
+        // First Mish
+        float sp = log1pf(expf(val));
+        float mish1 = val * tanhf(sp);
+        // Second Mish
+        float sp2 = log1pf(expf(mish1));
+        float mish2 = mish1 * tanhf(sp2);
+        out[idx] = mish2;
+    }
+}
+
+torch::Tensor double_mish_cuda(torch::Tensor input) {
+    // Ensure contiguous memory
+    auto in_contig = input.contiguous();
+    auto out = torch::empty_like(in_contig);
+    int size = in_contig.numel();
+
+    const int block_size = 256;
+    const int grid_size = (size + block_size - 1) / block_size;
+
+    double_mish_kernel<<<grid_size, block_size>>>(
+        in_contig.data_ptr<float>(),
+        out.data_ptr<float>(),
+        size
+    );
+
+    return out;
+}
+""";
+
+cpp_src = r"""
+torch::Tensor double_mish_cuda(torch::Tensor input);
+""";
+
+double_mish = load_inline(
+    name="double_mish",
+    cpp_sources=cpp_src,
+    cuda_sources=source,
+    functions=["double_mish_cuda"],
+    verbose=False
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that fuses two Mish activations into one custom CUDA kernel.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.double_mish = double_mish
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.double_mish.double_mish_cuda(x)
+        return x
+
+def get_inputs():
+    batch_size = 64
+    in_channels = 64
+    height = width = 256
+    return [torch.rand(batch_size, in_channels, height, width).cuda()]
+
+def get_init_inputs():
+    return [64, 128, 3]

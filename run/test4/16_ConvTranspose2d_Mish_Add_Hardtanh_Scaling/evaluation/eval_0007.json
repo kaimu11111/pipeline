@@ -1,0 +1,6 @@
+{
+  "runnable": false,
+  "phase": "repair",
+  "error_type": "RuntimeError",
+  "message": "Traceback (most recent call last):\n  File \"/home/wan00559/baseline/utils/compile_and_run.py\", line 229, in compare_and_bench\n    raise ValueError(f\"max_abs_err={max_err:.3e} > tol={tol}\")\nValueError: max_abs_err=2.172e+00 > tol=0.001\n"
+}

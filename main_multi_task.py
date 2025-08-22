@@ -4,6 +4,8 @@ import argparse
 import re
 import random
 import time
+import json
+import csv
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict, Any
@@ -17,9 +19,17 @@ from prompts.generate_custom_cuda import build_seed_prompt, system_prompt
 from utils.compile_and_run import compare_and_bench
 from utils.kernel_io import extract_code_block, save_kernel_code
 from scripts.individual import KernelIndividual  # adjust path if needed
-from prompts.error import COMPILE_ERROR
+from prompts.error import build_error_prompt
 from prompts.optimization import build_optimization_prompt
 
+_INVOCATION_SPLITTER = "Invoked with:"
+
+def _sanitize_error_message(exc: Exception) -> str:
+    """去掉 pybind 把大张量打印出来的部分，只保留报错关键信息。"""
+    msg = str(exc)
+    if _INVOCATION_SPLITTER in msg:
+        msg = msg.split(_INVOCATION_SPLITTER, 1)[0].rstrip()
+    return msg
 
 # ------------------------- CLI -------------------------
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -41,7 +51,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--repeat", type=int, default=20, help="Timed iterations per benchmark")
     p.add_argument("--tol", type=float, default=1e-3, help="Max |err| tolerated")
     p.add_argument("--max_tokens", type=int, default=16384, help="LLM max new tokens")
-    p.add_argument("--temperature", type=float, default=0.9, help="LLM temperature")
+    p.add_argument("--temperature", type=float, default=0.2, help="LLM temperature")
     p.add_argument("--top_p", type=float, default=1.0, help="LLM top_p")
     # multi-task controls
     p.add_argument("--first_n", type=int, default=0, help="When arch_py is a directory, take the first N tasks (sorted)")
@@ -118,9 +128,11 @@ def _make_llm_caller(args):
     return call_llm
 
 
-def _llm_to_kernel(prompt: str, code_dir: Path, call_llm) -> KernelIndividual:
+def _llm_to_kernel(prompt: str, code_dir: Path, call_llm, io_dir: Path, round_idx) -> KernelIndividual:
     """LLM -> code -> save -> KernelIndividual（不做评测）"""
     raw = call_llm(prompt)
+    reply_file = io_dir/ f"{round_idx}_raw_reply.txt"
+    reply_file.write_text(raw, encoding="utf-8")
     code = extract_code_block(raw) or raw  # fallback
     path = save_kernel_code(code, code_dir)
     ind = KernelIndividual(code)
@@ -159,16 +171,17 @@ def _bench_and_score(
         print(f"[{phase}] score={speedup:.4f}")
 
     except Exception as exc:
+        cleaned_msg = _sanitize_error_message(exc)
         ind.metrics = {
             "runnable": False,
             "phase": phase,
             "error_type": exc.__class__.__name__,
-            "message": _last_n_lines(str(exc)),
+            "message": _last_n_lines(cleaned_msg),
         }
         ind.score = float("-inf")
         print(f"[{phase}] failed. See metrics.message for details.")
 
-    # —— 无论成功/失败，都尝试保存 metrics —— 
+    # —— 无论成功/失败，都尝试保存 metrics ——
     if metrics_dir is not None:
         try:
             saved = ind.save_metrics(metrics_dir)
@@ -220,17 +233,20 @@ def _plot_scores(save_path: Path, scores: List[float], err_flags: List[bool], ti
 
 
 # --------------------- single-task run -----------------
-def _run_single_task(task_path: Path, args) -> Dict[str, Any]:
-    # --- per-task directories: run/<stamp>_<task>/{code,evaluation,figures}
-    run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    work_dir = (args.work_dir / f"{run_stamp}_{task_path.stem}").resolve()
-    code_dir = work_dir / "code"
-    eval_dir = work_dir / "evaluation"
-    fig_dir = work_dir / "figures"
+def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
+    # --- per-task directories under the SAME batch_dir
+    task_root = (batch_dir / task_path.stem).resolve()
+    code_dir = task_root / "code"
+    eval_dir = task_root / "evaluation"
+    fig_dir = task_root / "figures"
+    io_dir  = eval_dir / "llm_io" 
+    
+    
     code_dir.mkdir(parents=True, exist_ok=True)
     eval_dir.mkdir(parents=True, exist_ok=True)
     fig_dir.mkdir(parents=True, exist_ok=True)
-
+    io_dir.mkdir(parents=True, exist_ok=True)
+    
     call_llm = _make_llm_caller(args)
 
     current_kernel: Optional[KernelIndividual] = None
@@ -247,8 +263,9 @@ def _run_single_task(task_path: Path, args) -> Dict[str, Any]:
         if round_idx == 0:
             print("[Seed] Generating the initial kernel ...")
             seed_prompt = build_seed_prompt(arch_path=task_path, gpu_name=args.gpu)
-
-            ind = _llm_to_kernel(seed_prompt, code_dir, call_llm)
+            prompt_file = io_dir / f"round{round_idx:03d}_seed_prompt.txt"
+            prompt_file.write_text(seed_prompt, encoding="utf-8")
+            ind = _llm_to_kernel(seed_prompt, code_dir, call_llm, io_dir, round_idx)
             _bench_and_score(
                 ind,
                 ref_py=task_path,
@@ -266,11 +283,14 @@ def _run_single_task(task_path: Path, args) -> Dict[str, Any]:
             if not is_runnable:
                 print("[Repair] start repairing")
                 error_log = _last_n_lines(getattr(current_kernel, "metrics", {}).get("message", "")) if current_kernel else ""
-                repair_prompt = COMPILE_ERROR.substitute(
-                    OLD_CODE=(current_kernel.code if current_kernel else ""),  # type: ignore[union-attr]
-                    ERROR_LOG=error_log,
+                repair_prompt = build_error_prompt(
+                    old_code=current_kernel.code,
+                    error_log=error_log,
+                    gpu_name=args.gpu,
                 )
-                ind = _llm_to_kernel(repair_prompt, code_dir, call_llm)
+                prompt_file = io_dir / f"round{round_idx:03d}_repair_prompt.txt"
+                prompt_file.write_text(repair_prompt, encoding="utf-8")
+                ind = _llm_to_kernel(repair_prompt, code_dir, call_llm, io_dir, round_idx)
                 _bench_and_score(
                     ind,
                     ref_py=task_path,
@@ -278,7 +298,7 @@ def _run_single_task(task_path: Path, args) -> Dict[str, Any]:
                     warmup=args.warmup,
                     repeat=args.repeat,
                     tol=args.tol,
-                    phase="seed",
+                    phase="repair",
                     metrics_dir=eval_dir,
                 )
             else:
@@ -289,7 +309,9 @@ def _run_single_task(task_path: Path, args) -> Dict[str, Any]:
                     gpu_name=args.gpu,
                     history_block=history_block,
                 )
-                ind = _llm_to_kernel(opt_prompt, code_dir, call_llm)
+                prompt_file = io_dir / f"round{round_idx:03d}_opt_prompt.txt"
+                prompt_file.write_text(opt_prompt, encoding="utf-8")
+                ind = _llm_to_kernel(opt_prompt, code_dir, call_llm, io_dir, round_idx)
                 _bench_and_score(
                     ind,
                     ref_py=task_path,
@@ -297,7 +319,7 @@ def _run_single_task(task_path: Path, args) -> Dict[str, Any]:
                     warmup=args.warmup,
                     repeat=args.repeat,
                     tol=args.tol,
-                    phase="seed",
+                    phase="opt",
                     metrics_dir=eval_dir,
                 )
 
@@ -327,9 +349,39 @@ def _run_single_task(task_path: Path, args) -> Dict[str, Any]:
         "task": str(task_path),
         "best_score": float(best_score) if best_score != float("-inf") else 0.0,
         "best_runnable": bool(getattr(best_kernel, "metrics", {}).get("runnable", False)) if best_kernel else False,
-        "work_dir": str(work_dir),
+        "task_dir": str(task_root),
         "figure": str(fig_path),
     }
+
+
+# --------------------- summary saving ------------------
+def _save_global_summary(batch_dir: Path, summary: List[Dict[str, Any]], avg_speedup: float, accuracy: float) -> None:
+    """Save summary.json and summary.csv under the batch_dir."""
+    batch_dir.mkdir(parents=True, exist_ok=True)
+
+    # JSON
+    out_json = {
+        "avg_speedup": avg_speedup,
+        "accuracy": accuracy,
+        "num_tasks": len(summary),
+        "tasks": summary,
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    (batch_dir / "summary.json").write_text(json.dumps(out_json, indent=2), encoding="utf-8")
+
+    # CSV
+    csv_path = batch_dir / "summary.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["task", "best_score", "best_runnable", "task_dir", "figure"])
+        for s in summary:
+            writer.writerow([s["task"], f'{s["best_score"]:.6f}', int(bool(s["best_runnable"])), s["task_dir"], s["figure"]])
+        writer.writerow([])
+        writer.writerow(["avg_speedup", f"{avg_speedup:.6f}"])
+        writer.writerow(["accuracy", f"{accuracy:.6f}"])
+
+    print(f"[GLOBAL] Saved: {batch_dir/'summary.json'}")
+    print(f"[GLOBAL] Saved: {csv_path}")
 
 
 # --------------------------- main ----------------------
@@ -338,13 +390,28 @@ def main():
 
     all_tasks = _collect_tasks(args.arch_py)
 
-    # single file → run once
+    # ---- Create ONE batch folder for this run ----
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # batch name hints: single file uses file stem; directory uses 'batch'
     if args.arch_py.is_file():
-        res = _run_single_task(all_tasks[0], args)
+        batch_name = f"{stamp}_{args.arch_py.stem}"
+    else:
+        # include sampling info for traceability
+        pick_note = f"first{args.first_n}" if (args.first_n and args.first_n > 0) else f"num{args.num_tasks}_seed{args.shuffle_seed}"
+        batch_name = f"{stamp}_batch_{pick_note}"
+    batch_dir = (args.work_dir / batch_name).resolve()
+    batch_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[BATCH] Output folder: {batch_dir}")
+
+    # single file → run once (still inside the same batch folder)
+    if args.arch_py.is_file():
+        res = _run_single_task(all_tasks[0], args, batch_dir=batch_dir)
+        summary = [res]
         avg_speedup = res["best_score"]
         accuracy = 1.0 if res["best_runnable"] else 0.0
         print(f"[SUMMARY] {res}")
         print(f"[GLOBAL] Avg speedup={avg_speedup:.4f}, Accuracy={accuracy:.4f}")
+        _save_global_summary(batch_dir, summary, avg_speedup, accuracy)
         return
 
     # directory: first_n takes precedence; else optionally sample
@@ -358,7 +425,7 @@ def main():
     summary: List[Dict[str, Any]] = []
     for i, task in enumerate(picked, 1):
         print(f"\n===== [{i}/{len(picked)}] Running task: {task} =====")
-        res = _run_single_task(task, args)
+        res = _run_single_task(task, args, batch_dir=batch_dir)
         summary.append(res)
 
     # global summary using each task's best kernel
@@ -369,6 +436,9 @@ def main():
         for s in summary:
             print(f"{s['task']}: best_score={s['best_score']:.4f}  runnable={s['best_runnable']}  fig={s['figure']}")
         print(f"\n[GLOBAL] Avg speedup={avg_speedup:.4f}, Accuracy={accuracy:.4f}")
+
+        # ---- save under the SAME batch folder ----
+        _save_global_summary(batch_dir, summary, avg_speedup, accuracy)
     else:
         print("No tasks were run.")
 

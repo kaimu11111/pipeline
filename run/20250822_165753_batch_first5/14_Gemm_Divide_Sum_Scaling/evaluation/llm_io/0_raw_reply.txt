@@ -1,0 +1,130 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Custom CUDA sources
+source = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+// Naive matrix multiplication + divide-by-2 kernel
+__global__ void matmul_div2_kernel(const float* A, const float* B, float* C,
+                                   int M, int N, int K) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row < M && col < N) {
+        float val = 0.0f;
+        for (int i = 0; i < K; i++) {
+            val += A[row*K + i] * B[i*N + col];
+        }
+        C[row*N + col] = val / 2.0f;
+    }
+}
+
+// Sum along dim=1, then multiply by scale (output shape: (M))
+__global__ void sum_scale_kernel(const float* in, float* out, float scale,
+                                 int M, int N) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row < M) {
+        float val = 0.0f;
+        for (int i = 0; i < N; i++) {
+            val += in[row*N + i];
+        }
+        out[row] = val * scale;
+    }
+}
+
+torch::Tensor matmul_div2_cuda(torch::Tensor A, torch::Tensor B) {
+    // A: (M, K), B: (K, N)
+    // Out: (M, N), then divide by 2
+    int64_t M = A.size(0);
+    int64_t K = A.size(1);
+    int64_t N = B.size(1);
+
+    auto out = torch::zeros({M, N}, A.options());
+
+    dim3 block(16, 16);
+    dim3 grid((N + block.x - 1) / block.x, (M + block.y - 1) / block.y);
+
+    matmul_div2_kernel<<<grid, block>>>(A.data_ptr<float>(),
+                                        B.data_ptr<float>(),
+                                        out.data_ptr<float>(),
+                                        M, N, K);
+    return out;
+}
+
+torch::Tensor sum_scale_cuda(torch::Tensor in, float scale) {
+    // in: (M, N) -> sum over dim=1 -> (M), then multiply by scale
+    int64_t M = in.size(0);
+    int64_t N = in.size(1);
+
+    auto out = torch::zeros({M}, in.options());
+
+    int blockSize = 256;
+    int gridSize = (M + blockSize - 1) / blockSize;
+
+    sum_scale_kernel<<<gridSize, blockSize>>>(in.data_ptr<float>(),
+                                              out.data_ptr<float>(),
+                                              scale,
+                                              M, N);
+    return out;
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("matmul_div2_cuda", &matmul_div2_cuda, "Naive matmul + div by 2 (CUDA)");
+    m.def("sum_scale_cuda", &sum_scale_cuda,   "Sum along dim=1 then multiply by scale (CUDA)");
+}
+"""
+
+# Corresponding C++ header declarations
+cpp_src = r"""
+torch::Tensor matmul_div2_cuda(torch::Tensor A, torch::Tensor B);
+torch::Tensor sum_scale_cuda(torch::Tensor in, float scale);
+"""
+
+# Build/load the inline CUDA extension
+my_custom_ops = load_inline(
+    name="my_custom_ops",
+    cpp_sources=cpp_src,
+    cuda_sources=source,
+    extra_cflags=["-O3"],
+    verbose=False,
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized Model that performs:
+      - matrix multiplication (naive) + division by 2 in a single CUDA kernel
+      - sum along dim=1 + multiply by scaling factor in another CUDA kernel
+    """
+    def __init__(self, input_size, hidden_size, scaling_factor):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(torch.randn(hidden_size, input_size))
+        self.scaling_factor = scaling_factor
+
+    def forward(self, x):
+        # weight^T is shape (input_size, hidden_size)
+        w_t = self.weight.t().contiguous()
+        # First custom op: matmul + div by 2
+        out = my_custom_ops.matmul_div2_cuda(x, w_t)
+        # Second custom op: sum dim=1 then multiply by scaling_factor
+        out = my_custom_ops.sum_scale_cuda(out, self.scaling_factor)
+        # Reshape to (batch_size, 1)
+        out = out.unsqueeze(1)
+        return out
+
+# Variables for sizes
+batch_size = 1024
+input_size = 8192
+hidden_size = 8192
+scaling_factor = 1.5
+
+def get_inputs():
+    return [torch.rand(batch_size, input_size).cuda()]
+
+def get_init_inputs():
+    return [input_size, hidden_size, scaling_factor]
+```

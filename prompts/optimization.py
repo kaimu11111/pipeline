@@ -14,9 +14,6 @@ $history_block
 
 You are a CUDA-kernel optimization specialist.
 
-Target GPU: **NVIDIA $gpu_name ($gpu_arch)**
-$gpu_items
-
 Analyze the provided architecture and kernel history to produce an improved CUDA kernel.
 
 [ARCHITECTURE FILE]
@@ -30,28 +27,16 @@ GOAL
 - Maintain correctness within atol=1e-4 or rtol=1e-4.
 - Preserve the public Python API (same inputs/outputs, shapes, dtypes).
 
-CONSTRAINTS
-───────────
-- No test code, prints, timing, CLI.
-- No extra prose or markdown outside the code block.
-- Return exactly ONE fenced code block labeled `python`.
 
 OUTPUT RULES (STRICT) ────────────────────────────────────────────────
-1. Reply with **one—and only one—fenced Python block**.  No prose.
-2. The block must be directly runnable:
-       python model_new.py
-3. Inside the block, follow **exactly** this order:
+1. Inside the block, follow **exactly** this order:
    1. Imports – `torch`, `torch.nn`, `load_inline`.
    2. `source` – triple‑quoted CUDA string(s) (kernel + host wrapper).
    3. `cpp_src` – prototypes for *all* kernels you expose.
    4. **One** `load_inline` call per kernel group.
    5. `class ModelNew(nn.Module)` – mirrors original inputs/outputs but calls
       your CUDA kernels.
-4. **Do NOT include** testing code, `if __name__ == "__main__"`, or extra prose.
-
-# ==========================================================
-# ❶ OUTPUT FORMAT – Copy exactly
-Return the fixed script wrapped like this – no extra text:
+2. **Do NOT include** testing code, `if __name__ == "__main__"`, or extra prose.
 
 ```python
 # <your corrected code>
@@ -86,9 +71,6 @@ def build_optimization_prompt(
     hist = history_block or "(None)\n"
 
     return _OPTIMIZATION_PROMPT_TEMPLATE.substitute(
-        gpu_name=gpu_name,
-        gpu_arch=gpu_arch,
-        gpu_items=gpu_items,
         arch_src=arch_src,
         history_block=hist,
     )
