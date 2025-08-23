@@ -1,0 +1,201 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+
+source = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+// A fused kernel that performs naive convolution (stride=1, padding=0), then BatchNorm, and finally scales the output.
+// We assume NCHW format and use the running mean/var for BN (inference mode).
+// This is a simplified reference kernel (not highly optimized)!
+
+__global__ void fused_conv_bn_scale_kernel(
+    const float* __restrict__ input,     // [N, C_in, H_in, W_in]
+    const float* __restrict__ weight,    // [C_out, C_in, K, K]
+    const float* __restrict__ bias,      // [C_out]
+    const float* __restrict__ bn_mean,   // [C_out]
+    const float* __restrict__ bn_var,    // [C_out]
+    const float* __restrict__ bn_weight, // [C_out]
+    const float* __restrict__ bn_bias,   // [C_out]
+    float* __restrict__ output,          // [N, C_out, H_out, W_out]
+    const int N,
+    const int C_in,
+    const int H_in,
+    const int W_in,
+    const int C_out,
+    const int K,
+    const int H_out,
+    const int W_out,
+    const float eps,
+    const float scaling_factor
+)
+{
+    // Each thread processes exactly one output element (n, c_out, h, w).
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_size = N * C_out * H_out * W_out;
+    if (idx >= total_size) return;
+
+    // Decompose idx into (n, c_out, h_out, w_out).
+    int tmp = idx;
+    int n = tmp / (C_out * H_out * W_out);
+    tmp = tmp % (C_out * H_out * W_out);
+    int cout = tmp / (H_out * W_out);
+    tmp = tmp % (H_out * W_out);
+    int h = tmp / W_out;
+    int w = tmp % W_out;
+
+    // Naive convolution (no stride, no padding)
+    // Output shape is H_out = H_in - K + 1, W_out = W_in - K + 1
+    float val = 0.0f;
+    for(int cin = 0; cin < C_in; cin++) {
+        for(int kh = 0; kh < K; kh++) {
+            for(int kw = 0; kw < K; kw++) {
+                int in_h = h + kh;
+                int in_w = w + kw;
+                // bounds check (no padding)
+                if (in_h >= 0 && in_h < H_in && in_w >= 0 && in_w < W_in) {
+                    float inp_val = input[n*C_in*H_in*W_in + cin*H_in*W_in + in_h*W_in + in_w];
+                    float wgt_val = weight[cout*C_in*K*K + cin*K*K + kh*K + kw];
+                    val += inp_val * wgt_val;
+                }
+            }
+        }
+    }
+    // Add conv bias
+    val += bias[cout];
+
+    // BatchNorm inference transform:
+    // out = (val - mean) / sqrt(var + eps) * bn_weight + bn_bias
+    float mean_val = bn_mean[cout];
+    float var_val  = bn_var[cout];
+    float wgt_val  = bn_weight[cout];
+    float b_val    = bn_bias[cout];
+    val = (val - mean_val) / sqrtf(var_val + eps) * wgt_val + b_val;
+
+    // Scale
+    val *= scaling_factor;
+
+    // Write to output
+    output[idx] = val;
+}
+
+torch::Tensor fused_conv_bn_scale_cuda(
+    torch::Tensor x,             // input
+    torch::Tensor weight,        // conv weight
+    torch::Tensor bias,          // conv bias
+    torch::Tensor bn_mean,       // BN running mean
+    torch::Tensor bn_var,        // BN running var
+    torch::Tensor bn_weight,     // BN gamma
+    torch::Tensor bn_bias,       // BN beta
+    float eps,
+    float scaling_factor
+)
+{
+    // Shapes
+    int N = x.size(0);
+    int C_in = x.size(1);
+    int H_in = x.size(2);
+    int W_in = x.size(3);
+
+    int C_out = weight.size(0);
+    int K = weight.size(2); // kernel_size
+
+    // We'll assume stride=1, padding=0 for this naive kernel
+    int H_out = H_in - K + 1;
+    int W_out = W_in - K + 1;
+
+    // Allocate output tensor
+    auto out = torch::zeros({N, C_out, H_out, W_out}, x.options());
+
+    // Launch kernel
+    int total_size = N * C_out * H_out * W_out;
+    const int block = 256;
+    int grid = (total_size + block - 1) / block;
+    fused_conv_bn_scale_kernel<<<grid, block>>>(
+        x.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        bn_mean.data_ptr<float>(),
+        bn_var.data_ptr<float>(),
+        bn_weight.data_ptr<float>(),
+        bn_bias.data_ptr<float>(),
+        out.data_ptr<float>(),
+        N, C_in, H_in, W_in,
+        C_out, K,
+        H_out, W_out,
+        eps,
+        scaling_factor
+    );
+
+    return out;
+}
+""";
+
+# Declare the C++ function signature:
+cpp_src = r"""
+torch::Tensor fused_conv_bn_scale_cuda(
+    torch::Tensor x,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    torch::Tensor bn_mean,
+    torch::Tensor bn_var,
+    torch::Tensor bn_weight,
+    torch::Tensor bn_bias,
+    float eps,
+    float scaling_factor
+);
+"""
+
+# Build the fused kernel
+fused_conv_bn_scale = load_inline(
+    name="fused_conv_bn_scale",
+    cpp_sources=cpp_src,
+    cuda_sources=source,
+    functions=["fused_conv_bn_scale_cuda"],
+    verbose=False,
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Fused version of Model: does Conv2d + BatchNorm2d + scaling in one custom CUDA kernel.
+    Assumes a naive convolution (no stride/padding), for demonstration purposes.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, scaling_factor):
+        super(ModelNew, self).__init__()
+        # We'll still create nn.Conv2d and nn.BatchNorm2d modules to hold parameters,
+        # but we won't use their .forward(). We'll fetch their weights/stats for the fused kernel.
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, bias=True)
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.scaling_factor = scaling_factor
+
+    def forward(self, x):
+        # In BN eval mode, we use running_mean/var. We assume "self.bn" is in eval mode for this example.
+        return fused_conv_bn_scale.fused_conv_bn_scale_cuda(
+            x,
+            self.conv.weight,
+            self.conv.bias,
+            self.bn.running_mean,
+            self.bn.running_var,
+            self.bn.weight,
+            self.bn.bias,
+            self.bn.eps,
+            self.scaling_factor
+        )
+
+
+batch_size = 128
+in_channels = 8
+out_channels = 64
+height, width = 128, 128
+kernel_size = 3
+scaling_factor = 2.0
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width).cuda()]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, scaling_factor]

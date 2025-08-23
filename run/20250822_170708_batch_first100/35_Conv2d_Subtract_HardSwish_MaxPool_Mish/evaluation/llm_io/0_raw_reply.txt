@@ -1,0 +1,143 @@
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Custom CUDA source code
+cuda_source = r"""
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+// -------------------------------------------
+// subtract + HardSwish kernel
+// HardSwish(x) = x * clamp((x+3)/6, 0, 1)
+// -------------------------------------------
+__global__ void subtract_hardswish_kernel(
+    const float* __restrict__ x,
+    float* __restrict__ out,
+    float subtract_value,
+    int64_t size
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        float val = x[idx] - subtract_value;
+        float tmp = val + 3.0f;
+        float c = 0.0f;
+        if (tmp <= 0.0f) {
+            c = 0.0f;
+        } else if (tmp >= 6.0f) {
+            c = 1.0f;
+        } else {
+            c = tmp / 6.0f;
+        }
+        out[idx] = val * c;
+    }
+}
+
+torch::Tensor subtract_hardswish_cuda(torch::Tensor x, float subtract_value) {
+    auto out = torch::zeros_like(x);
+    int64_t size = x.numel();
+    const int block_size = 256;
+    const int grid_size = (size + block_size - 1) / block_size;
+
+    subtract_hardswish_kernel<<<grid_size, block_size>>>(
+        x.data_ptr<float>(),
+        out.data_ptr<float>(),
+        subtract_value,
+        size
+    );
+    return out;
+}
+
+// -------------------------------------------
+// Mish kernel
+// Mish(x) = x * tanh(softplus(x)), where
+// softplus(x) = log(1 + exp(x))
+// -------------------------------------------
+__device__ __forceinline__ float mish_fn(float x) {
+    float sp = log1pf(expf(x));
+    return x * tanhf(sp);
+}
+
+__global__ void mish_kernel(
+    const float* __restrict__ in,
+    float* __restrict__ out,
+    int64_t size
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        float val = in[idx];
+        out[idx] = mish_fn(val);
+    }
+}
+
+torch::Tensor mish_cuda(torch::Tensor x) {
+    auto out = torch::zeros_like(x);
+    int64_t size = x.numel();
+    const int block_size = 256;
+    const int grid_size = (size + block_size - 1) / block_size;
+
+    mish_kernel<<<grid_size, block_size>>>(
+        x.data_ptr<float>(),
+        out.data_ptr<float>(),
+        size
+    );
+    return out;
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("subtract_hardswish_cuda", &subtract_hardswish_cuda, "Custom subtract + HardSwish (CUDA)");
+    m.def("mish_cuda", &mish_cuda, "Custom Mish (CUDA)");
+}
+"""
+
+# Prototypes for the custom CUDA functions
+cpp_source = r"""
+torch::Tensor subtract_hardswish_cuda(torch::Tensor x, float subtract_value);
+torch::Tensor mish_cuda(torch::Tensor x);
+"""
+
+# Load and build the custom extension inline
+custom_cuda = load_inline(
+    name="custom_cuda_ops",
+    cpp_sources=cpp_source,
+    cuda_sources=cuda_source,
+    functions=["subtract_hardswish_cuda", "mish_cuda"],
+    verbose=False
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized Model that applies a convolution, then fuses subtract + HardSwish,
+    then uses MaxPool, and finally a custom Mish operator.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, subtract_value, pool_kernel_size):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.subtract_value = subtract_value
+        self.pool = nn.MaxPool2d(pool_kernel_size)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = custom_cuda.subtract_hardswish_cuda(x, self.subtract_value)
+        x = self.pool(x)
+        x = custom_cuda.mish_cuda(x)
+        return x
+
+batch_size = 128
+in_channels = 64
+out_channels = 128
+height = width = 128
+kernel_size = 3
+subtract_value = 0.5
+pool_kernel_size = 2
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, subtract_value, pool_kernel_size]
+```

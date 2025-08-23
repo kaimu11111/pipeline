@@ -1,0 +1,85 @@
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+source = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+// A fused kernel that applies Mish twice in one pass
+__global__ void double_mish_kernel(const float* __restrict__ in,
+                                   float* __restrict__ out,
+                                   const int size) 
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        float x = in[idx];
+        // First Mish
+        float sp = logf(1.0f + __expf(x));
+        float mish1 = x * tanhf(sp);
+        // Second Mish
+        float sp2 = logf(1.0f + __expf(mish1));
+        float mish2 = mish1 * tanhf(sp2);
+        out[idx] = mish2;
+    }
+}
+
+torch::Tensor double_mish_cuda(torch::Tensor input) {
+    auto size = input.numel();
+    auto output = torch::empty_like(input);
+
+    const int block_size = 256;
+    const int grid_size = (size + block_size - 1) / block_size;
+
+    double_mish_kernel<<<grid_size, block_size>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        size
+    );
+
+    return output;
+}
+""";
+
+cpp_src = r"""
+torch::Tensor double_mish_cuda(torch::Tensor input);
+""";
+
+# Build the inline CUDA extension
+double_mish = load_inline(
+    name="double_mish",
+    cpp_sources=cpp_src,
+    cuda_sources=source,
+    functions=["double_mish_cuda"],
+    verbose=False,
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs a convolution, then applies a fused two-step Mish.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, padding=kernel_size//2)
+        self.double_mish = double_mish
+
+    def forward(self, x):
+        x = self.conv(x)
+        # Use the fused double Mish CUDA kernel
+        x = self.double_mish.double_mish_cuda(x)
+        return x
+
+batch_size = 64
+in_channels = 64
+out_channels = 128
+height = width = 256
+kernel_size = 3
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width).cuda()]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size]

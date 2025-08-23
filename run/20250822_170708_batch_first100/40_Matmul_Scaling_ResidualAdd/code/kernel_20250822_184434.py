@@ -1,0 +1,136 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Here we fuse the linear (matmul + bias), scaling, and residual addition into one kernel.
+# The final output equals:
+#   out = (1 + scaling_factor) * (x @ weight^T + bias)
+# compared to the original steps:
+#   temp = x @ weight^T + bias
+#   out = temp * scaling_factor + temp = (1 + scaling_factor)*temp
+
+source = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <vector>
+
+// Fused kernel that computes: out[i, j] = alpha * ( sum_{k} A[i, k] * W[j, k] + b[j] )
+__global__ void fused_matmul_scale_bias_res_kernel(
+    const float* __restrict__ A,
+    const float* __restrict__ W,
+    const float* __restrict__ b,
+    float* __restrict__ C,
+    int batch_size,
+    int in_features,
+    int out_features,
+    float alpha)
+{
+    // 2D mapping of thread indices to output coordinates
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    int col = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (row < batch_size && col < out_features) {
+        float val = 0.0f;
+        // naive matmul accumulation
+        for (int k = 0; k < in_features; k++) {
+            val += A[row * in_features + k] * W[col * in_features + k];
+        }
+        // add bias, multiply alpha
+        val = alpha * (val + b[col]);
+        // write to output
+        C[row * out_features + col] = val;
+    }
+}
+
+torch::Tensor fused_matmul_scale_bias_res_cuda(
+    torch::Tensor A,
+    torch::Tensor W,
+    torch::Tensor b,
+    float alpha)
+{
+    // Check shapes
+    TORCH_CHECK(A.dim() == 2, "A must be 2D");
+    TORCH_CHECK(W.dim() == 2, "W must be 2D");
+    TORCH_CHECK(b.dim() == 1, "b must be 1D");
+
+    int batch_size = A.size(0);
+    int in_features = A.size(1);
+    int out_features = W.size(0);
+
+    // Allocate output tensor
+    auto opts = torch::TensorOptions().dtype(A.dtype()).device(A.device());
+    auto C = torch::empty({batch_size, out_features}, opts);
+
+    // Set up the grid and block dimensions
+    dim3 block(16, 16);
+    dim3 grid((batch_size + block.x - 1) / block.x,
+              (out_features + block.y - 1) / block.y);
+
+    // Launch kernel
+    fused_matmul_scale_bias_res_kernel<<<grid, block>>>(
+        A.data_ptr<float>(),
+        W.data_ptr<float>(),
+        b.data_ptr<float>(),
+        C.data_ptr<float>(),
+        batch_size,
+        in_features,
+        out_features,
+        alpha
+    );
+
+    return C;
+}
+"""
+
+cpp_src = r"""
+torch::Tensor fused_matmul_scale_bias_res_cuda(
+    torch::Tensor A,
+    torch::Tensor W,
+    torch::Tensor b,
+    float alpha);
+"""
+
+# Build the custom fused operator
+fused_op = load_inline(
+    name="fused_matmul_scale_bias_res",
+    cpp_sources=cpp_src,
+    cuda_sources=source,
+    functions=["fused_matmul_scale_bias_res_cuda"],
+    verbose=False,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that fuses the linear layer's matmul, scaling, and residual addition into one custom CUDA kernel.
+    """
+    def __init__(self, in_features, out_features, scaling_factor):
+        super(ModelNew, self).__init__()
+        # We replicate nn.Linear's parameters
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        self.bias = nn.Parameter(torch.empty(out_features))
+        # Use the same style of initialization as nn.Linear
+        nn.init.kaiming_uniform_(self.weight, a=5**0.5)
+        fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+        bound = 1 / fan_in**0.5
+        nn.init.uniform_(self.bias, -bound, bound)
+
+        # We'll fuse scaling_factor with 1 for the final output
+        self.alpha = 1.0 + scaling_factor
+
+    def forward(self, x):
+        # Fused matmul, scale, residual add in a single call
+        return fused_op.fused_matmul_scale_bias_res_cuda(x, self.weight, self.bias, self.alpha)
+
+# Provide the same interface for input generation
+batch_size = 16384
+in_features = 4096
+out_features = 4096
+scaling_factor = 0.5
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features, device='cuda')]
+
+def get_init_inputs():
+    return [in_features, out_features, scaling_factor]

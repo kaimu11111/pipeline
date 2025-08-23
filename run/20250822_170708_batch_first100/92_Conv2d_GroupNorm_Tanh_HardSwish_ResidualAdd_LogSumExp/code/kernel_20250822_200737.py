@@ -1,0 +1,156 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+source = r"""
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <vector>
+#include <cmath>
+
+__device__ __forceinline__ float hard_swish(float x) {
+    // HardSwish(x) = x * ReLU6(x+3) / 6
+    float t = x + 3.0f;
+    t = fmaxf(fminf(t, 6.0f), 0.0f);
+    return x * t * (1.0f / 6.0f);
+}
+
+// Fused tanh + HardSwish + residual addition kernel
+__global__ void fused_tanh_hardswish_res_kernel(
+    const float* __restrict__ x_conv,
+    const float* __restrict__ x_norm,
+    float* __restrict__ out,
+    int size
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        float tn = tanhf(x_norm[idx]);
+        float hs = hard_swish(tn);
+        out[idx] = x_conv[idx] + hs;
+    }
+}
+
+torch::Tensor fused_tanh_hardswish_res(torch::Tensor x_conv, torch::Tensor x_norm) {
+    auto out = torch::zeros_like(x_conv);
+    int size = x_conv.numel();
+
+    const int block_size = 256;
+    const int grid_size = (size + block_size - 1) / block_size;
+
+    fused_tanh_hardswish_res_kernel<<<grid_size, block_size>>>(
+        x_conv.data_ptr<float>(),
+        x_norm.data_ptr<float>(),
+        out.data_ptr<float>(),
+        size
+    );
+
+    return out;
+}
+
+// LogSumExp along dim=1 (channel dimension), keepdim=True
+// Input shape: (N, C, H, W). Output shape: (N, 1, H, W).
+__global__ void logsumexp_dim1_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int N, int C, int H, int W
+) {
+    // Each thread handles one (N, H, W) coordinate
+    int b = blockIdx.x;
+    int h = blockIdx.y;
+    int w = threadIdx.x;
+
+    int base_idx = ((b * C) * H + h) * W + w;
+    float max_val = -INFINITY;
+
+    // Find max along the channel dimension
+    for (int c = 0; c < C; c++) {
+        float val = input[base_idx + c * H * W];
+        if (val > max_val) {
+            max_val = val;
+        }
+    }
+
+    // Compute sum of exponentials
+    float sum_exp = 0.0f;
+    for (int c = 0; c < C; c++) {
+        float val = input[base_idx + c * H * W];
+        sum_exp += expf(val - max_val);
+    }
+
+    // Write final logsumexp
+    float lse = max_val + logf(sum_exp);
+    int out_idx = ((b * 1) * H + h) * W + w;
+    output[out_idx] = lse;
+}
+
+torch::Tensor logsumexp_dim1(torch::Tensor input) {
+    auto sizes = input.sizes();
+    int N = sizes[0];
+    int C = sizes[1];
+    int H = sizes[2];
+    int W = sizes[3];
+
+    auto out = torch::empty({N, 1, H, W}, input.options());
+
+    dim3 grid(N, H);
+    int block = W;
+    logsumexp_dim1_kernel<<<grid, block>>>(
+        input.data_ptr<float>(),
+        out.data_ptr<float>(),
+        N, C, H, W
+    );
+    return out;
+}
+""";
+
+cpp_src = r"""
+torch::Tensor fused_tanh_hardswish_res(torch::Tensor x_conv, torch::Tensor x_norm);
+torch::Tensor logsumexp_dim1(torch::Tensor input);
+""";
+
+custom_ops = load_inline(
+    name="custom_ops",
+    cpp_sources=cpp_src,
+    cuda_sources=source,
+    functions=["fused_tanh_hardswish_res", "logsumexp_dim1"],
+    verbose=False,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized Model that performs:
+    1) Convolution
+    2) Group Normalization
+    3) Fused Tanh + HardSwish + Residual Addition
+    4) Custom LogSumExp
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, groups, eps=1e-5):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.group_norm = nn.GroupNorm(groups, out_channels, eps=eps)
+        self.custom_ops = custom_ops
+
+    def forward(self, x):
+        x_conv = self.conv(x)
+        x_norm = self.group_norm(x_conv)
+        # Combined Tanh + HardSwish + Residual
+        x_res = self.custom_ops.fused_tanh_hardswish_res(x_conv, x_norm)
+        # Custom LogSumExp
+        x_logsumexp = self.custom_ops.logsumexp_dim1(x_res)
+        return x_logsumexp
+
+def get_inputs():
+    batch_size = 128
+    in_channels = 8
+    height, width = 128, 128
+    return [torch.rand(batch_size, in_channels, height, width).cuda()]
+
+def get_init_inputs():
+    in_channels = 8
+    out_channels = 64
+    kernel_size = 3
+    groups = 16
+    return [in_channels, out_channels, kernel_size, groups]

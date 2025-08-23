@@ -1,0 +1,141 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+source = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cmath>
+
+// A fused kernel that applies Softmax across dim=1 and then Sigmoid, for a 5D input [N,C,D,H,W].
+__global__ void fused_softmax_sigmoid_kernel(
+    const float* __restrict__ inData,
+    float* __restrict__ outData,
+    const int N,
+    const int C,
+    const int D,
+    const int H,
+    const int W)
+{
+    int spatialSize = D * H * W;      // Spatial size per channel
+    int batchSpatial = C * spatialSize; // Total per sample
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int totalSpatial = N * spatialSize; // How many "pixels" across all batches
+    if (idx >= totalSpatial) return;
+
+    // Decode n, d, h, w from idx
+    int n  = idx / spatialSize;
+    int r  = idx % spatialSize; 
+    int d  = r  / (H * W);
+    int rw = r  % (H * W);
+    int h  = rw / W;
+    int w  = rw % W;
+
+    // We'll store intermediate exponentials in a small stack array
+    // Assume C <= 256 for safety
+    __shared__ float tmp[256]; 
+    // Each thread uses local array in L1/SMEM only if it doesn't exceed blockDim.x * 256
+    // For safer usage we do a local array here:
+    float localExp[256]; 
+
+    // Find the maximum value to stabilize softmax
+    float maxVal = -1e30f;
+    for(int c = 0; c < C; c++){
+        int offset = n * batchSpatial + c * spatialSize + d * (H * W) + h * W + w;
+        float val = inData[offset];
+        maxVal = (val > maxVal) ? val : maxVal;
+    }
+
+    // Compute exponentials and accumulate their sum
+    float sumExp = 0.0f;
+    for(int c = 0; c < C; c++){
+        int offset = n * batchSpatial + c * spatialSize + d * (H * W) + h * W + w;
+        float e = expf(inData[offset] - maxVal);
+        localExp[c] = e;
+        sumExp += e;
+    }
+
+    // Write out: softmax then sigmoid
+    for(int c = 0; c < C; c++){
+        int offset = n * batchSpatial + c * spatialSize + d * (H * W) + h * W + w;
+        float sm = localExp[c] / sumExp;       // softmax
+        float sg = 1.0f / (1.0f + expf(-sm));  // sigmoid
+        outData[offset] = sg;
+    }
+}
+
+torch::Tensor fused_softmax_sigmoid_cuda(torch::Tensor x) {
+    TORCH_CHECK(x.dim() == 5, "Input tensor must be 5D [N,C,D,H,W]");
+    int N = x.size(0);
+    int C = x.size(1);
+    int D = x.size(2);
+    int H = x.size(3);
+    int W = x.size(4);
+
+    auto out = torch::zeros_like(x);
+
+    int totalSpatial = N * D * H * W;
+    const int blockSize = 256;
+    int gridSize = (totalSpatial + blockSize - 1) / blockSize;
+
+    fused_softmax_sigmoid_kernel<<<gridSize, blockSize>>>(
+        x.data_ptr<float>(),
+        out.data_ptr<float>(),
+        N, C, D, H, W
+    );
+
+    return out;
+}
+""";
+
+cpp_src = r"""
+torch::Tensor fused_softmax_sigmoid_cuda(torch::Tensor x);
+""";
+
+fused_ops = load_inline(
+    name="fused_softmax_sigmoid",
+    cpp_sources=cpp_src,
+    cuda_sources=source,
+    functions=["fused_softmax_sigmoid_cuda"],
+    verbose=False
+)
+
+class ModelNew(nn.Module):
+    """
+    Model that performs a 3D transposed convolution, then a fused Softmax+Sigmoid using a custom CUDA kernel.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, bias=True):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(
+            in_channels, 
+            out_channels, 
+            kernel_size, 
+            stride=stride, 
+            padding=padding, 
+            output_padding=output_padding, 
+            bias=bias
+        )
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        # Replace separate softmax and sigmoid with fused op
+        x = fused_ops.fused_softmax_sigmoid_cuda(x)
+        return x
+
+batch_size = 16
+in_channels = 32
+out_channels = 64
+D, H, W = 16, 32, 32
+kernel_size = 3
+stride = 2
+padding = 1
+output_padding = 1
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, D, H, W).cuda()]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, stride, padding, output_padding]
+```

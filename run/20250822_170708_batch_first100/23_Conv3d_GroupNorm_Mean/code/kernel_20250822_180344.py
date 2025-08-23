@@ -1,0 +1,93 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+mean_5d_source = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+// A very naive kernel to compute the mean across dimensions [1,2,3,4]
+// (C, D, H, W) for each batch index n in [0..N-1]
+// x has shape [N*C*D*H*W]
+// out has shape [N]
+__global__ void mean_5d_kernel(const float* x, float* out,
+                               int N, int C, int D, int H, int W) {
+    int n = blockIdx.x;
+    if (n < N) {
+        // Single-thread sum for demonstration purposes
+        // (One block per batch, one thread per block)
+        float sum_val = 0.0f;
+        int num_elements = C * D * H * W;
+        int offset = n * num_elements;
+        for (int i = 0; i < num_elements; i++) {
+            sum_val += x[offset + i];
+        }
+        out[n] = sum_val / (float)num_elements;
+    }
+}
+
+torch::Tensor mean_5d_cuda(torch::Tensor x,
+                           int N, int C, int D, int H, int W) {
+    // Output shape is [N]
+    auto out = torch::empty({N}, x.options());
+    
+    const dim3 blocks(N);
+    const dim3 threads(1);
+
+    mean_5d_kernel<<<blocks, threads>>>(x.data_ptr<float>(),
+                                        out.data_ptr<float>(),
+                                        N, C, D, H, W);
+    return out;
+}
+"""
+
+mean_5d_header = r"torch::Tensor mean_5d_cuda(torch::Tensor x, int N, int C, int D, int H, int W);"
+
+# Build the inline CUDA extension for the final mean
+mean_5d_module = load_inline(
+    name="mean_5d_module",
+    cpp_sources=mean_5d_header,
+    cuda_sources=mean_5d_source,
+    functions=["mean_5d_cuda"],
+    verbose=False,
+    extra_cflags=[],
+    extra_ldflags=[]
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized Model that performs a 3D convolution, applies Group Normalization, 
+    then calls a custom CUDA kernel to compute the mean.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, num_groups):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size)
+        self.group_norm = nn.GroupNorm(num_groups, out_channels)
+        self.mean_5d = mean_5d_module
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.group_norm(x)
+        # Custom CUDA mean across [1,2,3,4]
+        N, C, D, H, W = x.size()
+        # Flatten x for kernel access
+        x_reshaped = x.contiguous().view(-1)
+        x_mean = self.mean_5d.mean_5d_cuda(x_reshaped, N, C, D, H, W)
+        return x_mean
+
+
+# Keep the same input generation functions as in the original script
+batch_size = 128
+in_channels = 3
+out_channels = 24
+D, H, W = 24, 32, 32
+kernel_size = 3
+num_groups = 8
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, D, H, W).cuda()]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, num_groups]

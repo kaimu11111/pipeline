@@ -1,0 +1,220 @@
+import math
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Inline CUDA/C++ source implementing:
+# 1) A custom Linear (matmul + bias)
+# 2) A custom LogSumExp reduction
+# 3) A fused activation applying LeakyReLU -> LeakyReLU -> GELU -> GELU
+
+cuda_src = r'''
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cmath>
+
+// -------------------------------------
+// 1) Custom Linear kernel
+//    y = x * W^T + b
+// -------------------------------------
+__global__ void custom_linear_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    const float* __restrict__ b,
+    float* __restrict__ y,
+    const int M, const int K, const int N,
+    const bool has_bias
+){
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row < M && col < N) {
+        float val = 0.0f;
+        // x shape = [M, K], w shape = [N, K], we do y[row, col] = dot(x[row, :], w[col, :])
+        for (int e = 0; e < K; e++){
+            val += x[row*K + e] * w[col*K + e];
+        }
+        if (has_bias) {
+            val += b[col];
+        }
+        y[row*N + col] = val;
+    }
+}
+
+torch::Tensor custom_linear(
+    torch::Tensor x,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    bool has_bias
+){
+    const auto M = x.size(0);
+    const auto K = x.size(1);
+    const auto N = weight.size(0);
+
+    auto y = torch::zeros({(long)M, (long)N}, x.options());
+
+    dim3 block(16,16);
+    dim3 grid((N + block.x - 1) / block.x, (M + block.y - 1) / block.y);
+
+    custom_linear_kernel<<<grid, block>>>(
+        x.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias.defined() ? bias.data_ptr<float>() : nullptr,
+        y.data_ptr<float>(),
+        M, K, N,
+        has_bias
+    );
+
+    return y;
+}
+
+// -------------------------------------
+// 2) Custom LogSumExp (dim=1, keepdim=False here, then reshape in Python)
+//    out[i] = log(sum(exp(x[i, :]))) across columns
+// -------------------------------------
+__global__ void logsumexp_kernel(
+    const float* __restrict__ in,
+    float* __restrict__ out,
+    const int M, const int N
+){
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row < M) {
+        // Find max
+        float max_val = in[row*N];
+        for (int i = 1; i < N; i++){
+            float v = in[row*N + i];
+            if (v > max_val) {
+                max_val = v;
+            }
+        }
+        // Sum of exp
+        double sum_exp = 0.0;
+        for (int i = 0; i < N; i++){
+            sum_exp += expf(in[row*N + i] - max_val);
+        }
+        // logsumexp
+        out[row] = logf((float)sum_exp) + max_val;
+    }
+}
+
+torch::Tensor custom_logsumexp(torch::Tensor x){
+    const auto M = x.size(0);
+    const auto N = x.size(1);
+    auto out = torch::zeros({(long)M}, x.options());
+
+    const int threads = 256;
+    const int blocks = (M + threads - 1) / threads;
+
+    logsumexp_kernel<<<blocks, threads>>>(
+        x.data_ptr<float>(),
+        out.data_ptr<float>(),
+        M, N
+    );
+    return out;
+}
+
+// -------------------------------------
+// 3) Fused activation: 2x LeakyReLU -> 2x GELU
+//    leaky_relu(x) = x>0? x : slope*x
+//    approximate gelu with tanh-based formula
+// -------------------------------------
+__device__ __forceinline__ float leaky_relu(float x, float slope){
+    return x > 0.0f ? x : slope * x;
+}
+
+__device__ __forceinline__ float gelu(float x){
+    // tanh approximation
+    const float k0 = 0.7978845608f; // sqrt(2 / pi)
+    return 0.5f * x * (1.0f + tanhf(k0 * x * (1.0f + 0.044715f * x * x)));
+}
+
+__global__ void fused_activation_kernel(
+    const float* __restrict__ in,
+    float* __restrict__ out,
+    const int size,
+    float slope
+){
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        float val = in[idx];
+        // 2x LeakyReLU
+        val = leaky_relu(val, slope);
+        val = leaky_relu(val, slope);
+        // 2x GELU
+        val = gelu(val);
+        val = gelu(val);
+        out[idx] = val;
+    }
+}
+
+torch::Tensor fused_activation(torch::Tensor x, float slope){
+    auto out = torch::zeros_like(x);
+    const int size = x.numel();
+    const int threads = 256;
+    const int blocks = (size + threads - 1) / threads;
+
+    fused_activation_kernel<<<blocks, threads>>>(
+        x.data_ptr<float>(),
+        out.data_ptr<float>(),
+        size,
+        slope
+    );
+    return out;
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("custom_linear", &custom_linear, "Custom Linear");
+    m.def("custom_logsumexp", &custom_logsumexp, "Custom LogSumExp");
+    m.def("fused_activation", &fused_activation, "Fused Activation (2x LeakyReLU -> 2x GELU)");
+}
+'''
+
+cpp_decl = r'''
+torch::Tensor custom_linear(torch::Tensor x, torch::Tensor weight, torch::Tensor bias, bool has_bias);
+torch::Tensor custom_logsumexp(torch::Tensor x);
+torch::Tensor fused_activation(torch::Tensor x, float slope);
+'''
+
+# Build the custom ops
+custom_ops = load_inline(
+    name="custom_ops",
+    cpp_sources=cpp_decl,
+    cuda_sources=cuda_src,
+    functions=["custom_linear", "custom_logsumexp", "fused_activation"],
+    verbose=False
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized Model with custom CUDA kernels:
+    1) Custom Linear
+    2) Custom LogSumExp
+    3) Fused activation (2x LeakyReLU -> 2x GELU)
+    """
+    def __init__(self, in_features, out_features, bias=True):
+        super(ModelNew, self).__init__()
+        self.has_bias = bias
+        # Register parameters similar to nn.Linear
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_features))
+        else:
+            self.register_parameter('bias', None)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.has_bias:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+            bound = 1 / math.sqrt(fan_in)
+            nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x):
+        # Custom linear (Gemm)
+        x = custom_ops.custom_linear(x, self.weight, self.bias if self.has_bias else torch.tensor([]).cuda(), self.has_bias)
+        # Custom LogSumExp along dimension=1 => shape is [batch_size]
+        x = custom_ops.custom_logsumexp(x)
+        # Reshape to [batch_size, 1]
+        x = x.unsqueeze(1)
+        # Fused activation kernel: 2x LeakyReLU -> 2x GELU
+        x = custom_ops.fused_activation(x, 0.01)
+        return x

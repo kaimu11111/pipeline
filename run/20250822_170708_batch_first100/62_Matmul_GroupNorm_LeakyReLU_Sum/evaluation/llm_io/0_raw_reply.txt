@@ -1,0 +1,77 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Custom CUDA kernel to fuse leaky ReLU and elementwise sum (x + x = 2*x).
+# out = 2 * LeakyReLU(x)
+CUDA_SRC = r'''
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void fused_leakyrelu_sum_kernel(const float* __restrict__ in,
+                                           float* __restrict__ out,
+                                           const float negative_slope,
+                                           const int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        float val = in[idx];
+        float relu_val = (val >= 0.0f) ? val : (negative_slope * val);
+        out[idx] = 2.0f * relu_val;
+    }
+}
+
+torch::Tensor fused_leakyrelu_sum_cuda(torch::Tensor x, float negative_slope) {
+    auto out = torch::empty_like(x);
+    int size = x.numel();
+    const int block = 256;
+    const int grid = (size + block - 1) / block;
+    fused_leakyrelu_sum_kernel<<<grid, block>>>(x.data_ptr<float>(),
+                                               out.data_ptr<float>(),
+                                               negative_slope,
+                                               size);
+    return out;
+}
+'''
+
+CPP_HDR = r'''
+torch::Tensor fused_leakyrelu_sum_cuda(torch::Tensor x, float negative_slope);
+'''
+
+# Build the inline extension
+fused_ops = load_inline(
+    name="fused_leakyrelu_sum",
+    cpp_sources=CPP_HDR,
+    cuda_sources=CUDA_SRC,
+    functions=["fused_leakyrelu_sum_cuda"],
+    verbose=False
+)
+
+class ModelNew(nn.Module):
+    """
+    A model that performs a matrix multiplication, group normalization, fused leaky ReLU + element-wise sum.
+    """
+    def __init__(self, input_size, hidden_size, num_groups, eps=1e-5, negative_slope=0.01):
+        super(ModelNew, self).__init__()
+        self.fc = nn.Linear(input_size, hidden_size)
+        self.gn = nn.GroupNorm(num_groups=num_groups, num_channels=hidden_size, eps=eps)
+        self.negative_slope = negative_slope
+
+    def forward(self, x):
+        x = self.fc(x)
+        x = self.gn(x)
+        # Fused leaky ReLU and "x = x + x" => 2*LeakyReLU(x)
+        x = fused_ops.fused_leakyrelu_sum_cuda(x, self.negative_slope)
+        return x
+
+batch_size = 1024
+input_size = 8192
+hidden_size = 8192
+num_groups = 512
+
+def get_inputs():
+    return [torch.rand(batch_size, input_size).cuda()]
+
+def get_init_inputs():
+    return [input_size, hidden_size, num_groups]
+```

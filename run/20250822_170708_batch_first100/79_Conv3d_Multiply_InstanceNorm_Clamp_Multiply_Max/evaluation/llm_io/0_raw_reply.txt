@@ -1,0 +1,142 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Custom CUDA source for fused multiply->clamp->multiply->max
+source = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <limits>
+
+__global__ void fused_ops_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ multiplier,
+    float* __restrict__ out,
+    int N, int C, int D, int H, int W,
+    float clamp_min, float clamp_max
+) {
+    int index = blockDim.x * blockIdx.x + threadIdx.x;
+    int total = N * D * H * W;
+    if (index < total) {
+        int ndhw = D * H * W;
+        int dhw = H * W;
+        int hw = W;
+        
+        int n = index / ndhw;
+        int r1 = index % ndhw;
+        int d = r1 / dhw;
+        int r2 = r1 % dhw;
+        int h = r2 / hw;
+        int w = r2 % hw;
+
+        float max_val = -FLT_MAX;
+        for (int c = 0; c < C; c++) {
+            // Compute the index for x in [N, C, D, H, W] format
+            int x_idx = n * (C * ndhw) + c * ndhw + d * dhw + h * hw + w;
+            float val = x[x_idx];
+
+            float mult = multiplier[c]; // multiplier shape [C, 1, 1, 1]
+
+            // multiply -> clamp -> multiply
+            val = val * mult;
+            if (val < clamp_min) val = clamp_min;
+            if (val > clamp_max) val = clamp_max;
+            val = val * mult;
+
+            // keep track of max
+            if (val > max_val) {
+                max_val = val;
+            }
+        }
+
+        // Write the result to out at [N, D, H, W] format
+        int out_idx = n * (D * H * W) + d * (H * W) + h * W + w;
+        out[out_idx] = max_val;
+    }
+}
+
+torch::Tensor fused_ops_cuda(torch::Tensor x, 
+                             torch::Tensor multiplier,
+                             float clamp_min,
+                             float clamp_max) {
+    TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
+    TORCH_CHECK(multiplier.is_cuda(), "multiplier must be a CUDA tensor");
+    
+    auto sizes = x.sizes(); // [N, C, D, H, W]
+    int N = sizes[0];
+    int C = sizes[1];
+    int D = sizes[2];
+    int H = sizes[3];
+    int W = sizes[4];
+
+    // output shape = [N, D, H, W]
+    auto out = torch::empty({N, D, H, W}, x.options());
+
+    int total = N * D * H * W;
+    const int block_size = 256;
+    int grid_size = (total + block_size - 1) / block_size;
+
+    fused_ops_kernel<<<grid_size, block_size>>>(
+        x.data_ptr<float>(),
+        multiplier.data_ptr<float>(),
+        out.data_ptr<float>(),
+        N, C, D, H, W,
+        clamp_min, clamp_max
+    );
+
+    return out;
+}
+""";
+
+cpp_src = r"""
+torch::Tensor fused_ops_cuda(torch::Tensor x, 
+                             torch::Tensor multiplier,
+                             float clamp_min,
+                             float clamp_max);
+""";
+
+# Load the fused kernel
+fused_ops = load_inline(
+    name="fused_ops",
+    cpp_sources=cpp_src,
+    cuda_sources=source,
+    functions=["fused_ops_cuda"],
+    verbose=False
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized architecture using a custom CUDA kernel to fuse multiply, clamp, multiply, and max.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, multiplier_shape, clamp_min, clamp_max):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size)
+        self.multiplier = nn.Parameter(torch.randn(multiplier_shape))
+        self.instance_norm = nn.InstanceNorm3d(out_channels)
+        self.clamp_min = clamp_min
+        self.clamp_max = clamp_max
+        self.fused_ops = fused_ops
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.instance_norm(x)
+        # fused multiply->clamp->multiply->max across channel dim
+        x = self.fused_ops.fused_ops_cuda(x, self.multiplier, self.clamp_min, self.clamp_max)
+        return x
+
+batch_size = 128
+in_channels = 3
+out_channels = 16
+depth, height, width = 16, 32, 32
+kernel_size = 3
+multiplier_shape = (out_channels, 1, 1, 1)
+clamp_min = -1.0
+clamp_max = 1.0
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, depth, height, width).cuda()]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, multiplier_shape, clamp_min, clamp_max]
+```

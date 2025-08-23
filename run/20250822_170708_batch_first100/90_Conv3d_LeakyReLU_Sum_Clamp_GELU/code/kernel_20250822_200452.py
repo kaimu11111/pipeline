@@ -1,0 +1,137 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Inline CUDA code that fuses leaky_relu + sum + clamp + gelu
+# We assume sum_tensor is shaped (out_channels,1,1,1) but will flatten to (out_channels,)
+# for the CUDA kernel. The kernel handles the per-element index in (N, C, D, H, W).
+source = r'''
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cmath>
+#include <algorithm>
+
+__device__ inline float leaky_relu(float x, float slope) {
+    return (x >= 0.0f) ? x : slope * x;
+}
+
+__device__ inline float clampf(float x, float lo, float hi) {
+    return fminf(fmaxf(x, lo), hi);
+}
+
+// Approximate or exact gelu: here, we do the exact version using erf
+__device__ inline float gelu(float x) {
+    // 1/sqrt(2) ~ 0.70710678
+    const float kBeta = 0.70710678118f;
+    float cdf = 0.5f * (1.0f + erff(x * kBeta));
+    return x * cdf;
+}
+
+__global__ void fused_activation_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ sum_tensor,
+    float* __restrict__ out,
+    const int N,
+    const int C,
+    const int D,
+    const int H,
+    const int W,
+    const float negative_slope
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * C * D * H * W;
+    if (idx < total) {
+        // Decompose the flat index into (n, c, d, h, w)
+        int w_idx = idx % W;
+        int tmp1 = idx / W;
+        int h_idx = tmp1 % H;
+        int tmp2 = tmp1 / H;
+        int d_idx = tmp2 % D;
+        int tmp3 = tmp2 / D;
+        int c_idx = tmp3 % C;
+        // int n_idx = tmp3 / C;  // n_idx not actually needed to compute the operations.
+
+        float val = x[idx];
+        // leaky_relu
+        val = leaky_relu(val, negative_slope);
+        // sum with sum_tensor[c]
+        val += sum_tensor[c_idx];
+        // clamp
+        val = clampf(val, -1.0f, 1.0f);
+        // gelu
+        val = gelu(val);
+
+        out[idx] = val;
+    }
+}
+
+torch::Tensor fused_activation_cuda(
+    torch::Tensor x,
+    torch::Tensor sum_tensor,
+    float negative_slope
+) {
+    // Ensure x and sum_tensor are float tensors in contiguous format
+    x = x.contiguous();
+    sum_tensor = sum_tensor.contiguous();
+
+    auto out = torch::zeros_like(x);
+
+    int N = x.size(0);
+    int C = x.size(1);
+    int D = x.size(2);
+    int H = x.size(3);
+    int W = x.size(4);
+
+    int total = N * C * D * H * W;
+
+    const int block_size = 256;
+    const int grid_size = (total + block_size - 1) / block_size;
+
+    fused_activation_kernel<<<grid_size, block_size>>>(
+        x.data_ptr<float>(),
+        sum_tensor.data_ptr<float>(),
+        out.data_ptr<float>(),
+        N, C, D, H, W,
+        negative_slope
+    );
+
+    return out;
+}
+'''
+
+cpp_src = r'''
+torch::Tensor fused_activation_cuda(
+    torch::Tensor x,
+    torch::Tensor sum_tensor,
+    float negative_slope
+);
+'''
+
+# Build the inline CUDA extension
+fused_activation_mod = load_inline(
+    name="fused_activation_mod",
+    cpp_sources=cpp_src,
+    cuda_sources=source,
+    functions=["fused_activation_cuda"],
+    verbose=False
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that keeps the 3D convolution in PyTorch, then fuses
+    leaky_relu + sum + clamp + gelu into a single custom CUDA kernel.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, sum_tensor_shape):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size)
+        # Flatten sum_tensor to shape (C,) to simplify kernel indexing
+        self.sum_tensor = nn.Parameter(torch.randn(sum_tensor_shape).view(-1))
+        self.negative_slope = 0.2
+
+    def forward(self, x):
+        x = self.conv(x)
+        # fused custom CUDA kernel performs:
+        #   leaky_relu -> + sum_tensor -> clamp -> gelu
+        x = fused_activation_mod.fused_activation_cuda(x, self.sum_tensor, self.negative_slope)
+        return x

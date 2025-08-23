@@ -1,0 +1,118 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Custom CUDA code: fused matmul + bias (from nn.Linear) + Swish activation + extra bias
+source = r'''
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cmath>
+
+__global__ void fused_matmul_swish_bias_kernel(
+    const float* __restrict__ A,          // [B, K]
+    const float* __restrict__ W,          // [M, K]
+    const float* __restrict__ matmul_bias,// [M]
+    const float* __restrict__ extra_bias, // [M]
+    float* __restrict__ out,             // [B, M]
+    int B, 
+    int K, 
+    int M
+) {
+    int b = blockDim.y * blockIdx.y + threadIdx.y;
+    int m = blockDim.x * blockIdx.x + threadIdx.x;
+    if (b < B && m < M) {
+        float val = 0.0f;
+        // matrix multiply
+        for (int k = 0; k < K; ++k) {
+            val += A[b * K + k] * W[m * K + k];
+        }
+        // add matmul bias
+        val += matmul_bias[m];
+        // swish activation: x * sigmoid(x)
+        float sigmoid_val = 1.0f / (1.0f + expf(-val));
+        val = val * sigmoid_val;
+        // add extra bias
+        val += extra_bias[m];
+        // write out
+        out[b * M + m] = val;
+    }
+}
+
+torch::Tensor fused_matmul_swish_bias(
+    torch::Tensor A,
+    torch::Tensor W,
+    torch::Tensor matmul_bias,
+    torch::Tensor extra_bias
+) {
+    TORCH_CHECK(A.is_cuda(), "A must be a CUDA tensor");
+    TORCH_CHECK(W.is_cuda(), "W must be a CUDA tensor");
+    TORCH_CHECK(matmul_bias.is_cuda(), "matmul_bias must be a CUDA tensor");
+    TORCH_CHECK(extra_bias.is_cuda(), "extra_bias must be a CUDA tensor");
+
+    int B = A.size(0);    // batch size
+    int K = A.size(1);    // in_features
+    int M = W.size(0);    // out_features
+
+    auto out = torch::empty({B, M}, A.options());
+
+    dim3 block(16, 16);
+    dim3 grid((M + block.x - 1) / block.x, (B + block.y - 1) / block.y);
+
+    fused_matmul_swish_bias_kernel<<<grid, block>>>(
+        A.data_ptr<float>(),
+        W.data_ptr<float>(),
+        matmul_bias.data_ptr<float>(),
+        extra_bias.data_ptr<float>(),
+        out.data_ptr<float>(),
+        B,
+        K,
+        M
+    );
+
+    return out;
+}
+'''
+
+cpp_src = r'''
+torch::Tensor fused_matmul_swish_bias(
+    torch::Tensor A,
+    torch::Tensor W,
+    torch::Tensor matmul_bias,
+    torch::Tensor extra_bias
+);
+'''
+
+# Compile the inline CUDA code
+fused_ops = load_inline(
+    name="fused_matmul_swish_bias_ops",
+    cpp_sources=cpp_src,
+    cuda_sources=source,
+    functions=["fused_matmul_swish_bias"],
+    verbose=False,
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that fuses matmul, bias addition, Swish activation,
+    and extra bias addition into a single custom CUDA kernel,
+    followed by a PyTorch GroupNorm.
+    """
+    def __init__(self, in_features, out_features, num_groups, bias_shape):
+        super(ModelNew, self).__init__()
+        # Match shapes from original model
+        self.weight = nn.Parameter(torch.randn(out_features, in_features))
+        self.matmul_bias = nn.Parameter(torch.randn(out_features))
+        self.extra_bias = nn.Parameter(torch.randn(bias_shape))
+        self.group_norm = nn.GroupNorm(num_groups, out_features)
+
+    def forward(self, x):
+        # fused matmul + bias + swish + extra bias
+        x = fused_ops.fused_matmul_swish_bias(
+            x, 
+            self.weight,
+            self.matmul_bias,
+            self.extra_bias
+        )
+        # Run group normalization
+        x = self.group_norm(x)
+        return x

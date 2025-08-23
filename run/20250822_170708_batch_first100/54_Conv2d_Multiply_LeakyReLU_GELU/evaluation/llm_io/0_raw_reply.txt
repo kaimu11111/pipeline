@@ -1,0 +1,107 @@
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Fused kernel for (x * multiplier) -> LeakyReLU -> GELU
+source = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__device__ __forceinline__ float gelu(float x) {
+    // Approximate or exact version of GELU. Here we use the error function.
+    return 0.5f * x * (1.0f + erff(x * 0.70710678118f));
+}
+
+__global__ void fused_kernel(const float* __restrict__ x,
+                             const float* __restrict__ multiplier,
+                             float* __restrict__ out,
+                             int N, int C, int H, int W,
+                             float negative_slope) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_size = N * C * H * W;
+    if (idx < total_size) {
+        // Calculate the channel index
+        int c = (idx / (H * W)) % C;
+        float val = x[idx];
+        // Apply elementwise multiplication
+        val *= multiplier[c];
+        // Apply LeakyReLU
+        if (val < 0.0f) {
+            val = negative_slope * val;
+        }
+        // Apply GELU
+        val = gelu(val);
+        out[idx] = val;
+    }
+}
+
+torch::Tensor fused_leakyrelu_gelu_cuda(torch::Tensor x, torch::Tensor multiplier) {
+    auto N = x.size(0);
+    auto C = x.size(1);
+    auto H = x.size(2);
+    auto W = x.size(3);
+
+    auto out = torch::zeros_like(x);
+    int total_size = N * C * H * W;
+
+    const int block_size = 256;
+    const int grid_size = (total_size + block_size - 1) / block_size;
+
+    fused_kernel<<<grid_size, block_size>>>(
+        x.data_ptr<float>(),
+        multiplier.view({-1}).data_ptr<float>(),
+        out.data_ptr<float>(),
+        N, C, H, W,
+        0.01f  // LeakyReLU negative slope
+    );
+
+    return out;
+}
+""".strip()
+
+cpp_src = r"""
+torch::Tensor fused_leakyrelu_gelu_cuda(torch::Tensor x, torch::Tensor multiplier);
+"""
+
+# Build the custom CUDA extension
+fused_leakyrelu_gelu = load_inline(
+    name="fused_leakyrelu_gelu",
+    cpp_sources=cpp_src,
+    cuda_sources=source,
+    extra_cflags=["-O3"],
+    extra_ldflags=[],
+    verbose=False,
+    functions=["fused_leakyrelu_gelu_cuda"]
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that uses a standard Conv2d, then a fused CUDA kernel
+    for elementwise multiplication -> LeakyReLU -> GELU.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, multiplier_shape):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.multiplier = nn.Parameter(torch.randn(multiplier_shape))
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = fused_leakyrelu_gelu.fused_leakyrelu_gelu_cuda(x, self.multiplier)
+        return x
+
+batch_size = 64
+in_channels = 64
+out_channels = 64
+height, width = 256, 256
+kernel_size = 3
+multiplier_shape = (out_channels, 1, 1)
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width).cuda()]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, multiplier_shape]
+```

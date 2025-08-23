@@ -1,0 +1,99 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+source = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__device__ __forceinline__ float mish_activation(float x) {
+    // mish(x) = x * tanh(softplus(x))
+    float sp = logf(1.0f + expf(x));
+    float t = tanhf(sp);
+    return x * t;
+}
+
+__global__ void fused_linear_mish_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    const float* __restrict__ b,
+    float* __restrict__ out,
+    int batch_size, int in_features, int out_features)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid < batch_size * out_features) {
+        int i = tid / out_features;  // row in output
+        int j = tid % out_features;  // column in output
+        float val = 0.0f;
+        // matrix multiplication
+        for (int k = 0; k < in_features; k++) {
+            val += x[i * in_features + k] * w[j * in_features + k];
+        }
+        val += b[j];
+        // apply Mish twice
+        val = mish_activation(val);
+        val = mish_activation(val);
+        out[i * out_features + j] = val;
+    }
+}
+
+torch::Tensor fused_linear_mish(torch::Tensor x, torch::Tensor w, torch::Tensor b) {
+    // x: (batch_size, in_features)
+    // w: (out_features, in_features)
+    // b: (out_features)
+    // out: (batch_size, out_features)
+    auto batch_size = x.size(0);
+    auto in_features = x.size(1);
+    auto out_features = w.size(0);
+
+    auto out = torch::zeros({batch_size, out_features}, x.options());
+    
+    int total = batch_size * out_features;
+    const int block_size = 256;
+    const int grid_size = (total + block_size - 1) / block_size;
+
+    fused_linear_mish_kernel<<<grid_size, block_size>>>(
+        x.data_ptr<float>(),
+        w.data_ptr<float>(),
+        b.data_ptr<float>(),
+        out.data_ptr<float>(),
+        batch_size,
+        in_features,
+        out_features
+    );
+    return out;
+}
+"""
+
+cpp_src = "torch::Tensor fused_linear_mish(torch::Tensor x, torch::Tensor w, torch::Tensor b);"
+
+fused_extension = load_inline(
+    name="fused_linear_mish_extension",
+    cpp_sources=cpp_src,
+    cuda_sources=source,
+    functions=["fused_linear_mish"],
+    verbose=False,
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model using custom CUDA kernel for linear + Mish + Mish.
+    """
+    def __init__(self, in_features, out_features):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(torch.randn(out_features, in_features, device='cuda'))
+        self.bias = nn.Parameter(torch.randn(out_features, device='cuda'))
+
+    def forward(self, x):
+        return fused_extension.fused_linear_mish(x, self.weight, self.bias)
+
+batch_size = 1024
+in_features = 8192
+out_features = 8192
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features, device='cuda')]
+
+def get_init_inputs():
+    return [in_features, out_features]

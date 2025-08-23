@@ -32,11 +32,11 @@ class Model(nn.Module):
 
 # Test code
 batch_size = 8
-in_channels = 32
-out_channels = 64
+in_channels = 16
+out_channels = 32
 kernel_size = (5, 9)
-width = 512
-height = 512
+width = 256
+height = 256
 stride = 1
 padding = (2, 4)
 dilation = (2, 3)

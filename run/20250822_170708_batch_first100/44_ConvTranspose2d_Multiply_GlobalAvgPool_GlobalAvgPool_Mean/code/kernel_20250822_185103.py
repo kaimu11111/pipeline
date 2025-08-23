@@ -1,0 +1,115 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+source = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <vector>
+
+__global__ void multiply_and_two_gavg_kernel(const float* __restrict__ input,
+                                             float* __restrict__ output,
+                                             const float multiplier,
+                                             const int N,
+                                             const int C,
+                                             const int H,
+                                             const int W) {
+    // Each block handles one (n, c) pair
+    int nc = blockIdx.x;
+    if (nc >= N * C) return;
+
+    int n = nc / C;
+    int c = nc % C;
+
+    // Compute input offset
+    const int offset_in = (n * C + c) * H * W;
+
+    // We'll sum up all elements in this (n,c) slice after multiplying
+    // then do the global average across H*W, then do the "second" global
+    // average (which is effectively the same result).
+    __shared__ float sdata[256];
+    float partial_sum = 0.0f;
+
+    for (int idx = threadIdx.x; idx < H * W; idx += blockDim.x) {
+        float val = input[offset_in + idx] * multiplier;
+        partial_sum += val;
+    }
+    // Store in shared mem
+    sdata[threadIdx.x] = partial_sum;
+    __syncthreads();
+
+    // Parallel reduction
+    int t = blockDim.x / 2;
+    while (t > 0) {
+        if (threadIdx.x < t) {
+            sdata[threadIdx.x] += sdata[threadIdx.x + t];
+        }
+        __syncthreads();
+        t /= 2;
+    }
+
+    // The first thread in the block writes the result
+    if (threadIdx.x == 0) {
+        // First global average (dim=[2,3])
+        float mean_val = sdata[0] / (H * W);
+        // Second global average is over the same shape (1x1), so it's the same value
+        output[nc] = mean_val;
+    }
+}
+
+torch::Tensor multiply_and_two_gavg_cuda(torch::Tensor input, float multiplier) {
+    TORCH_CHECK(input.dim() == 4, "Input must be a 4D tensor");
+    auto N = input.size(0);
+    auto C = input.size(1);
+    auto H = input.size(2);
+    auto W = input.size(3);
+
+    // Output shape is (N, C, 1, 1)
+    auto options = input.options();
+    auto out = torch::zeros({N, C, 1, 1}, options);
+
+    int threads = 256;
+    int blocks = N * C;
+    multiply_and_two_gavg_kernel<<<blocks, threads>>>(
+        input.data_ptr<float>(),
+        out.data_ptr<float>(),
+        multiplier,
+        N, C, H, W
+    );
+
+    return out;
+}
+""";
+
+cpp_src = r"""
+torch::Tensor multiply_and_two_gavg_cuda(torch::Tensor input, float multiplier);
+""";
+
+# Compile the inline CUDA code for the multiply + 2x global average pooling kernel
+mul_two_gavg = load_inline(
+    name="mul_two_gavg",
+    cpp_sources=cpp_src,
+    cuda_sources=source,
+    functions=["multiply_and_two_gavg_cuda"],
+    verbose=True,
+    extra_cflags=[],
+    extra_ldflags=[],
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized Model that performs a transposed convolution, multiplies by a scalar, 
+    applies global average pooling, another global average pooling (fused into one kernel).
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, multiplier):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose2d(in_channels, out_channels, kernel_size,
+                                                 stride=stride, padding=padding, 
+                                                 output_padding=output_padding)
+        self.multiplier = multiplier
+        self.mul_two_gavg = mul_two_gavg
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        x = self.mul_two_gavg.multiply_and_two_gavg_cuda(x, self.multiplier)
+        return x

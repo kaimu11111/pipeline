@@ -1,0 +1,135 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+source = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cmath>
+
+// A single fused kernel performing:
+// 1) GEMM: Y = X * W^T + B
+// 2) Sigmoid on Y
+// 3) Scale the sigmoid output
+// 4) Residual add (add original Y)
+__global__ void gemm_sigmoid_scale_add_kernel(
+    const float* __restrict__ X,
+    const float* __restrict__ W,
+    const float* __restrict__ B,
+    float* __restrict__ Y,
+    int batch_size,
+    int input_size,
+    int hidden_size,
+    float scale
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int totalElems = batch_size * hidden_size;
+    if (idx < totalElems) {
+        int i = idx / hidden_size;
+        int j = idx % hidden_size;
+
+        // GEMM partial sum for Y(i,j)
+        float val = 0.0f;
+        const float* x_row = X + i * input_size;
+        const float* w_row = W + j * input_size;
+        for (int k = 0; k < input_size; ++k) {
+            val += x_row[k] * w_row[k];
+        }
+
+        // Add bias
+        val += B[j];
+        float original = val;
+
+        // Sigmoid
+        float sigmoid_val = 1.0f / (1.0f + expf(-val));
+
+        // Scale
+        sigmoid_val *= scale;
+
+        // Residual add
+        float out_val = sigmoid_val + original;
+
+        Y[idx] = out_val;
+    }
+}
+
+torch::Tensor gemm_sigmoid_scale_add_cuda(
+    torch::Tensor x,
+    torch::Tensor w,
+    torch::Tensor b,
+    float scale
+) {
+    // Expected shapes:
+    //   x: (batch_size, input_size)
+    //   w: (hidden_size, input_size)
+    //   b: (hidden_size)
+    // Output shape: (batch_size, hidden_size)
+
+    TORCH_CHECK(x.dim() == 2, "x must be 2D");
+    TORCH_CHECK(w.dim() == 2, "w must be 2D");
+    TORCH_CHECK(b.dim() == 1, "b must be 1D");
+
+    int batch_size = x.size(0);
+    int input_size = x.size(1);
+    int hidden_size = w.size(0);
+
+    auto y = torch::empty({batch_size, hidden_size}, x.options());
+
+    int blockSize = 256;
+    int gridSize = (batch_size * hidden_size + blockSize - 1) / blockSize;
+
+    gemm_sigmoid_scale_add_kernel<<<gridSize, blockSize>>>(
+        x.data_ptr<float>(),
+        w.data_ptr<float>(),
+        b.data_ptr<float>(),
+        y.data_ptr<float>(),
+        batch_size,
+        input_size,
+        hidden_size,
+        scale
+    );
+
+    return y;
+}
+""";
+
+cpp_src = r"""
+torch::Tensor gemm_sigmoid_scale_add_cuda(
+    torch::Tensor x,
+    torch::Tensor w,
+    torch::Tensor b,
+    float scale
+);
+""";
+
+# Build the fused kernel as a Python extension
+fused_ops = load_inline(
+    name="gemm_sigmoid_scale_add_fused_ops",
+    cpp_sources=cpp_src,
+    cuda_sources=source,
+    functions=["gemm_sigmoid_scale_add_cuda"],
+    verbose=False,
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized Model implementing the pattern "Gemm_Sigmoid_Scaling_ResidualAdd"
+    using a single fused custom CUDA kernel.
+    """
+    def __init__(self, input_size, hidden_size, scaling_factor):
+        super(ModelNew, self).__init__()
+        # Mimic nn.Linear by creating weight and bias
+        self.weight = nn.Parameter(torch.empty(hidden_size, input_size))
+        self.bias = nn.Parameter(torch.empty(hidden_size))
+        nn.init.xavier_normal_(self.weight)
+        nn.init.zeros_(self.bias)
+
+        self.scaling_factor = scaling_factor
+
+    def forward(self, x):
+        return fused_ops.gemm_sigmoid_scale_add_cuda(
+            x,
+            self.weight,
+            self.bias,
+            float(self.scaling_factor)
+        )
