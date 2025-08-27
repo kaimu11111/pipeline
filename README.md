@@ -9,3 +9,4 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 python -m vllm.entrypoints.openai.api_server   --mo
 ```bash
 python3 main_multi_task.py KernelBench/level2   --first_n 100   --gpu "Quadro RTX 6000"   --server_type openai   --model_name o1   --device 7   --round 1
 ```
+# pipeline
