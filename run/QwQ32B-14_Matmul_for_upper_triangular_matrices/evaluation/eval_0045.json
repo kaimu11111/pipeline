@@ -1,6 +1,0 @@
-{
-  "runnable": false,
-  "phase": "seed",
-  "error_type": "RuntimeError",
-  "message": "Traceback (most recent call last):\n  File \"/home/wan00559/baseline/utils/compile_and_run.py\", line 225, in compare_and_bench\n    diff      = (test_out - ref_out).abs()\n                 ~~~~~~~~~^~~~~~~~~\nRuntimeError: The size of tensor a (724) must match the size of tensor b (512) at non-singleton dimension 1\n"
-}

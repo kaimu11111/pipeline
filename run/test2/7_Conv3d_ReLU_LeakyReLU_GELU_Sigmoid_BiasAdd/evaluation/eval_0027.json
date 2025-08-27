@@ -1,6 +1,0 @@
-{
-  "runnable": false,
-  "phase": "repair",
-  "error_type": "RuntimeError",
-  "message": "Traceback (most recent call last):\n  File \"/home/wan00559/baseline/utils/compile_and_run.py\", line 220, in compare_and_bench\n    test_model = ModelNew(*init_args, **init_kwargs)\n                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/wan00559/baseline/run/20250822_140850_batch_first5/7_Conv3d_ReLU_LeakyReLU_GELU_Sigmoid_BiasAdd/code/kernel_20250822_151512.py\", line 261, in __init__\n    self.negative_slope = float(negative_slope)\n                          ^^^^^^^^^^^^^^^^^^^^^\nTypeError: float() argument must be a string or a real number, not 'tuple'\n"
-}

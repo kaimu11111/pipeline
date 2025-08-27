@@ -21,7 +21,7 @@ from utils.kernel_io import extract_code_block, save_kernel_code
 from scripts.individual import KernelIndividual  # adjust path if needed
 from prompts.error import build_error_prompt
 from prompts.optimization import build_optimization_prompt
-
+from prompts.judger_repair import build_correctness_prompts
 _INVOCATION_SPLITTER = "Invoked with:"
 
 def _sanitize_error_message(exc: Exception) -> str:
@@ -140,6 +140,56 @@ def _llm_to_kernel(prompt: str, code_dir: Path, call_llm, io_dir: Path, round_id
     return ind
 
 
+# ================== 顶层 worker：必须放在模块顶层，不能写在函数里 ==================
+def _bench_worker_entry(test_py: str,
+                        ref_py: str,
+                        device_idx: int,
+                        warmup: int,
+                        repeat: int,
+                        tol: float,
+                        conn) -> None:
+    """
+    子进程入口：固定 GPU，调用 compare_and_bench，把结果或错误通过 Pipe 传回父进程。
+    注意：这里传的是字符串路径，避免传不可 pickl e 的对象。
+    """
+    import torch
+    from pathlib import Path
+
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.set_device(device_idx)
+
+        res = compare_and_bench(
+            ref_py=Path(ref_py),
+            test_py=Path(test_py),
+            device_idx=device_idx,
+            warmup=warmup,
+            repeat=repeat,
+            tol=tol,
+        )
+        conn.send(("ok", res))
+    except Exception as e:
+        # 清洗错误信息（如果你的工具函数可用就用它们；否则退化为 str(e)）
+        try:
+            cleaned = _sanitize_error_message(e)
+            msg = _last_n_lines(cleaned)
+        except Exception:
+            msg = str(e)
+        conn.send(("err", msg))
+    finally:
+        # 子进程末尾尽量同步，让错误在本轮内暴露
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.synchronize(device_idx)
+            except Exception:
+                pass
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+# ================== 保持原功能的 _bench_and_score（使用 spawn + 顶层 worker） ==================
 def _bench_and_score(
     ind: KernelIndividual,
     *,
@@ -151,43 +201,96 @@ def _bench_and_score(
     phase: str = "seed",
     metrics_dir: Path | None = None,
 ) -> None:
-    """评测并更新个体的 metrics/score；异常时填充失败信息，并在指定目录保存 metrics。"""
+    """
+    评测并更新个体的 metrics/score；异常时填充失败信息，并在指定目录保存 metrics。
+    与原版功能一致，但把 compare_and_bench 放到 **spawn 子进程**中执行，隔离 CUDA 上下文。
+    """
+    import torch
+    from multiprocessing import get_context
+
+    ctx = get_context("spawn")
+    parent_conn, child_conn = ctx.Pipe(duplex=False)
+
+    # 只传可 pickl e 的参数：路径字符串等
+    p = ctx.Process(
+        target=_bench_worker_entry,
+        args=(
+            str(ind.code_path),  # type: ignore[attr-defined]
+            str(ref_py),
+            device_idx,
+            warmup,
+            repeat,
+            tol,
+            child_conn,
+        ),
+    )
+    p.start()
+    # 父进程不使用子端
     try:
-        metrics = compare_and_bench(
-            ref_py=ref_py,
-            test_py=ind.code_path,  # type: ignore[attr-defined]
-            device_idx=device_idx,
-            warmup=warmup,
-            repeat=repeat,
-            tol=tol,
-        )
-        metrics["runnable"] = True
-        metrics["phase"] = phase
-        speedup = metrics["ref_latency_ms"]["avg"] / max(1e-9, metrics["test_latency_ms"]["avg"])
-        metrics["score"] = speedup
+        child_conn.close()
+    except Exception:
+        pass
 
-        ind.metrics = metrics
-        ind.score = speedup
-        print(f"[{phase}] score={speedup:.4f}")
+    # 等待子进程结束并接收 payload
+    p.join()
+    payload = parent_conn.recv() if parent_conn.poll() else None
+    try:
+        parent_conn.close()
+    except Exception:
+        pass
 
-    except Exception as exc:
-        cleaned_msg = _sanitize_error_message(exc)
+    # —— 根据子进程返回更新 metrics/score（与原逻辑保持一致）——
+    if isinstance(payload, tuple) and len(payload) == 2 and payload[0] in ("ok", "err"):
+        tag, data = payload
+        if tag == "ok":
+            metrics = data
+            metrics["runnable"] = True
+            metrics["phase"] = phase
+            speedup = metrics["ref_latency_ms"]["avg"] / max(1e-9, metrics["test_latency_ms"]["avg"])
+            metrics["score"] = speedup
+
+            ind.metrics = metrics
+            ind.score = speedup
+            print(f"[{phase}] score={speedup:.4f}")
+        else:
+            ind.metrics = {
+                "runnable": False,
+                "phase": phase,
+                "error_type": "RuntimeError",
+                "message": data,
+            }
+            ind.score = float("-inf")
+            print(f"[{phase}] failed. See metrics.message for details.")
+    else:
+        # 子进程异常退出且未回传数据
         ind.metrics = {
             "runnable": False,
             "phase": phase,
-            "error_type": exc.__class__.__name__,
-            "message": _last_n_lines(cleaned_msg),
+            "error_type": "SubprocessCrashed",
+            "message": "subprocess exited unexpectedly (no payload received)",
         }
         ind.score = float("-inf")
-        print(f"[{phase}] failed. See metrics.message for details.")
+        print(f"[{phase}] failed. Subprocess crashed.")
 
-    # —— 无论成功/失败，都尝试保存 metrics ——
+    # —— 与原版一致：无论成功/失败都尝试保存 metrics ——
     if metrics_dir is not None:
         try:
             saved = ind.save_metrics(metrics_dir)
             print(f"[{phase}] metrics saved to: {saved}")
         except Exception as save_exc:
             print(f"[{phase}] WARNING: failed to save metrics: {save_exc}")
+
+    # 父进程做一次轻量清理（非必须，但更稳）
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.synchronize(device_idx)
+        except Exception:
+            pass
+        try:
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+        except Exception:
+            pass
 
 
 # ---------------------- task helpers -------------------
@@ -283,6 +386,12 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
             if not is_runnable:
                 print("[Repair] start repairing")
                 error_log = _last_n_lines(getattr(current_kernel, "metrics", {}).get("message", "")) if current_kernel else ""
+                
+                
+                ##TODO
+                '''
+                Add judge here for the problem identifing, after get the problem list, give it to the repair_prompt
+                '''
                 repair_prompt = build_error_prompt(
                     old_code=current_kernel.code,
                     error_log=error_log,
@@ -302,6 +411,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                     metrics_dir=eval_dir,
                 )
             else:
+                break
                 print("Optimizing start")
                 history_block = _build_history_block(code_dir, keep_last=10)
                 opt_prompt = build_optimization_prompt(

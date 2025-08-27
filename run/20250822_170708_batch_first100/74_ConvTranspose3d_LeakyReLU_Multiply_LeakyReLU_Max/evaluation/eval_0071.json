@@ -1,6 +1,0 @@
-{
-  "runnable": false,
-  "phase": "seed",
-  "error_type": "RuntimeError",
-  "message": "Traceback (most recent call last):\n  File \"/home/wan00559/baseline/utils/compile_and_run.py\", line 223, in compare_and_bench\n    test_out, _ = _run_once(test_model, inp, dev)\n                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/wan00559/baseline/utils/compile_and_run.py\", line 129, in _run_once\n    end.synchronize()\n  File \"/home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/cuda/streams.py\", line 227, in synchronize\n    super().synchronize()\nRuntimeError: CUDA error: an illegal memory access was encountered\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.\nFor debugging consider passing CUDA_LAUNCH_BLOCKING=1\nCompile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.\n\n"
-}

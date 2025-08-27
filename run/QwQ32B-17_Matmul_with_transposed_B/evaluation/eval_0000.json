@@ -1,6 +1,0 @@
-{
-  "runnable": false,
-  "phase": "seed",
-  "error_type": "CompilationError",
-  "message": "unterminated string literal (detected at line 119) (kernel_20250818_104519.py, line 119)"
-}

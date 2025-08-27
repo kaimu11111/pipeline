@@ -1,6 +1,0 @@
-{
-  "runnable": false,
-  "phase": "seed",
-  "error_type": "RuntimeError",
-  "message": "Traceback (most recent call last):\n  File \"/home/wan00559/baseline/utils/compile_and_run.py\", line 223, in compare_and_bench\n    test_out, _ = _run_once(test_model, inp, dev)\n                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/wan00559/baseline/utils/compile_and_run.py\", line 127, in _run_once\n    out = model(*inp)\n          ^^^^^^^^^^^\n  File \"/home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/nn/modules/module.py\", line 1751, in _wrapped_call_impl\n    return self._call_impl(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/nn/modules/module.py\", line 1762, in _call_impl\n    return forward_call(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/wan00559/baseline/run/20250818_103519_17_Matmul_with_transposed_B/code/kernel_20250818_104700.py\", line 110, in forward\n    return self.matmul_cuda(A.cuda(), B.cuda()).cuda()\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nTypeError: 'module' object is not callable\n"
-}

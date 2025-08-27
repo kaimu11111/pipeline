@@ -42,6 +42,11 @@ OLD CODE (read-only)
 ────────────────────────────────────────
 $OLD_CODE
 
+────────────────────────────────────────
+Main Critical Problem
+────────────────────────────────────────
+$Problem
+
 ```python
 # <your corrected code>
 ```
@@ -54,6 +59,7 @@ def build_error_prompt(
     *,
     old_code: str,
     error_log: str,
+    problem: Optional[str] = None,
     gpu_name: Optional[str] = None,
 ) -> str:
     """
@@ -102,4 +108,5 @@ def build_error_prompt(
     return COMPILE_ERROR.substitute(
         ERROR_LOG=error_log.strip(),
         OLD_CODE=old_code.strip(),
+        Problem = problem.strip(),
     )

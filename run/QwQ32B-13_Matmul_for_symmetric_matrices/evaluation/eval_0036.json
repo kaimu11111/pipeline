@@ -1,6 +1,0 @@
-{
-  "runnable": false,
-  "phase": "seed",
-  "error_type": "CompilationError",
-  "message": "load_inline() missing 1 required positional argument: 'cpp_sources'"
-}

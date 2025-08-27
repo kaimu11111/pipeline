@@ -1,6 +1,0 @@
-{
-  "runnable": false,
-  "phase": "repair",
-  "error_type": "RuntimeError",
-  "message": "Traceback (most recent call last):\n  File \"/home/wan00559/baseline/utils/compile_and_run.py\", line 220, in compare_and_bench\n    test_model = ModelNew(*init_args, **init_kwargs)\n                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/wan00559/baseline/run/20250822_140328_batch_first5/15_ConvTranspose3d_BatchNorm_Subtract/code/kernel_20250822_155237.py\", line 319, in __init__\n    nn.init.kaiming_uniform_(self.weight, a=torch.sqrt(torch.tensor(5.0)))\n  File \"/home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/nn/init.py\", line 514, in kaiming_uniform_\n    gain = calculate_gain(nonlinearity, a)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/nn/init.py\", line 132, in calculate_gain\n    raise ValueError(f\"negative_slope {param} not a valid number\")\nValueError: negative_slope 2.2360680103302 not a valid number\n"
-}
