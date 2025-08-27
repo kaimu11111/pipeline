@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Kernel gets 2-D x,y but should receive 4-D",
+  "why_it_matters": "InstanceNorm2d in reference normalizes over 4096 spatial elements; kernel sees S=1, gives wrong mean/variance, causing 30-level output errors.",
+  "minimal_fix_hint": "Unsqueeze x (and y) to N,C,1,1 before kernel or normalize across feature dim."
+}
+```

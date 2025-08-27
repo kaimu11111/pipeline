@@ -1,0 +1,172 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# ------------------  Custom CUDA Kernels  ------------------ #
+cuda_source = r"""
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <vector>
+
+template <typename scalar_t>
+__global__ void scale_forward_kernel(const scalar_t* __restrict__ input,
+                                     const scalar_t* __restrict__ scale,
+                                     scalar_t* __restrict__ output,
+                                     int total_elems,
+                                     int features) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_elems) return;
+    int f = idx % features;
+    output[idx] = input[idx] * scale[f];
+}
+
+template <typename scalar_t>
+__global__ void scale_backward_input_kernel(const scalar_t* __restrict__ grad_output,
+                                            const scalar_t* __restrict__ scale,
+                                            scalar_t* __restrict__ grad_input,
+                                            int total_elems,
+                                            int features) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_elems) return;
+    int f = idx % features;
+    grad_input[idx] = grad_output[idx] * scale[f];
+}
+
+template <typename scalar_t>
+__global__ void scale_backward_scale_kernel(const scalar_t* __restrict__ grad_output,
+                                            const scalar_t* __restrict__ input,
+                                            scalar_t* __restrict__ grad_scale,
+                                            int total_elems,
+                                            int features) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_elems) return;
+    int f = idx % features;
+    atomicAdd(&grad_scale[f], grad_output[idx] * input[idx]);
+}
+
+torch::Tensor scale_forward_cuda(torch::Tensor input, torch::Tensor scale) {
+    const int batch_size = input.size(0);
+    const int features   = input.size(1);
+    const int total_elems = batch_size * features;
+
+    auto output = torch::empty_like(input);
+
+    const int threads = 256;
+    const int blocks  = (total_elems + threads - 1) / threads;
+
+    AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), "scale_forward_cuda", ([&] {
+        scale_forward_kernel<scalar_t><<<blocks, threads>>>(
+            input.data_ptr<scalar_t>(),
+            scale.data_ptr<scalar_t>(),
+            output.data_ptr<scalar_t>(),
+            total_elems,
+            features);
+    }));
+    return output;
+}
+
+std::vector<torch::Tensor> scale_backward_cuda(torch::Tensor grad_output,
+                                               torch::Tensor input,
+                                               torch::Tensor scale) {
+    const int batch_size = input.size(0);
+    const int features   = input.size(1);
+    const int total_elems = batch_size * features;
+
+    auto grad_input  = torch::empty_like(input);
+    auto grad_scale  = torch::zeros_like(scale);
+
+    const int threads = 256;
+    const int blocks  = (total_elems + threads - 1) / threads;
+
+    AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), "scale_backward_input_cuda", ([&] {
+        scale_backward_input_kernel<scalar_t><<<blocks, threads>>>(
+            grad_output.data_ptr<scalar_t>(),
+            scale.data_ptr<scalar_t>(),
+            grad_input.data_ptr<scalar_t>(),
+            total_elems,
+            features);
+    }));
+
+    AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), "scale_backward_scale_cuda", ([&] {
+        scale_backward_scale_kernel<scalar_t><<<blocks, threads>>>(
+            grad_output.data_ptr<scalar_t>(),
+            input.data_ptr<scalar_t>(),
+            grad_scale.data_ptr<scalar_t>(),
+            total_elems,
+            features);
+    }));
+
+    return {grad_input, grad_scale};
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("scale_forward_cuda",  &scale_forward_cuda,  "Scale multiply forward (CUDA)");
+    m.def("scale_backward_cuda", &scale_backward_cuda, "Scale multiply backward (CUDA)");
+}
+"""
+
+cpp_decls = """
+torch::Tensor scale_forward_cuda(torch::Tensor input, torch::Tensor scale);
+std::vector<torch::Tensor> scale_backward_cuda(torch::Tensor grad_output,
+                                               torch::Tensor input,
+                                               torch::Tensor scale);
+"""
+
+scale_cuda = load_inline(
+    name="scale_cuda",
+    cpp_sources=cpp_decls,
+    cuda_sources=cuda_source,
+    functions=["scale_forward_cuda", "scale_backward_cuda"],
+    verbose=False,
+)
+
+# ------------------  Autograd Wrapper  ------------------ #
+class ScaleFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input, scale):
+        output = scale_cuda.scale_forward_cuda(input.contiguous(), scale.contiguous())
+        ctx.save_for_backward(input, scale)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        input, scale = ctx.saved_tensors
+        grad_input, grad_scale = scale_cuda.scale_backward_cuda(
+            grad_output.contiguous(), input.contiguous(), scale.contiguous()
+        )
+        return grad_input, grad_scale
+
+def scale_mul(input, scale):
+    return ScaleFunction.apply(input, scale)
+
+# ------------------  Optimized Model  ------------------ #
+class ModelNew(nn.Module):
+    """
+    Optimized model that keeps the high-performance cuBLAS GEMM from nn.Linear,
+    replaces the element-wise scaling with a custom fused CUDA kernel, and then
+    applies batch normalization.
+    """
+    def __init__(self, in_features, out_features, scale_shape, eps=1e-5, momentum=0.1):
+        super(ModelNew, self).__init__()
+        self.gemm  = nn.Linear(in_features, out_features)
+        self.scale = nn.Parameter(torch.randn(scale_shape))
+        self.bn    = nn.BatchNorm1d(out_features, eps=eps, momentum=momentum)
+
+    def forward(self, x):
+        x = self.gemm(x)
+        x = scale_mul(x, self.scale)
+        x = self.bn(x)
+        return x
+
+# ------------------  Helper Functions (unchanged)  ------------------ #
+batch_size   = 4096
+in_features  = 2048
+out_features = 2048
+scale_shape  = (out_features,)
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features, device="cuda")]
+
+def get_init_inputs():
+    return [in_features, out_features, scale_shape]

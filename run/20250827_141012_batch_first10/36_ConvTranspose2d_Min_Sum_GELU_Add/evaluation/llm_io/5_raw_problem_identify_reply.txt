@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Uses per-width bias; reference uses scalar bias",
+  "why_it_matters": "Kernel adds bias[w] varying across width, but PyTorch adds one scalar broadcasted, yielding incorrect output values.",
+  "minimal_fix_hint": "replace bias[w] with bias[0] or pass scalar bias"
+}
+```

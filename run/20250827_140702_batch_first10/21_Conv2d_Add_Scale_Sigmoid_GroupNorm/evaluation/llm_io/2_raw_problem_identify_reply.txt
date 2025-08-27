@@ -1,0 +1,5 @@
+{
+  "critical_issue": "Conv layer adds padding=kernel_size//2",
+  "why_it_matters": "Reference uses zero padding, candidate keeps spatial size, altering every downstream value and output tensor shape.",
+  "minimal_fix_hint": "Remove padding parameter in ModelNew.conv"
+}

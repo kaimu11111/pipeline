@@ -1,0 +1,223 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# ------------------------------------------------------------------
+# CUDA / C++ source
+# ------------------------------------------------------------------
+source = r"""
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <float.h>
+
+/////////////////////////////////////////////////////////////////
+// helpers for warp & block reduction
+/////////////////////////////////////////////////////////////////
+template <typename T>
+__inline__ __device__ T warpReduceSum(T val){
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1){
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    }
+    return val;
+}
+
+template <typename T>
+__inline__ __device__ T warpReduceMax(T val){
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1){
+        T other = __shfl_down_sync(0xffffffff, val, offset);
+        val     = val > other ? val : other;
+    }
+    return val;
+}
+
+/*
+ * After the final warp-level reduction only threads in warp-0
+ * hold the correct aggregate (`val`).  We therefore write that
+ * result to shared[0], synchronise the block, and return the
+ * broadcasted value so **every** thread sees the same result.
+ */
+template <typename T>
+__inline__ __device__ T blockReduceSum(T val){
+    static __shared__ T shared[32];          // up to 32 warps / block
+    const int lane = threadIdx.x & 31;       // thread index within warp
+    const int wid  = threadIdx.x >> 5;       // warp id within block
+
+    val = warpReduceSum(val);                // per-warp reduction
+    if (lane == 0) shared[wid] = val;        // write warp result
+    __syncthreads();
+
+    val = (threadIdx.x < (blockDim.x >> 5)) ? shared[lane] : (T)0;
+    if (wid == 0){
+        val = warpReduceSum(val);            // final reduction in warp-0
+    }
+
+    if (lane == 0) shared[0] = val;          // broadcast
+    __syncthreads();
+    return shared[0];
+}
+
+template <typename T>
+__inline__ __device__ T blockReduceMax(T val){
+    static __shared__ T shared[32];
+    const int lane = threadIdx.x & 31;
+    const int wid  = threadIdx.x >> 5;
+
+    val = warpReduceMax(val);
+    if (lane == 0) shared[wid] = val;
+    __syncthreads();
+
+    val = (threadIdx.x < (blockDim.x >> 5)) ? shared[lane] : -FLT_MAX;
+    if (wid == 0){
+        val = warpReduceMax(val);
+    }
+
+    if (lane == 0) shared[0] = val;
+    __syncthreads();
+    return shared[0];
+}
+
+/////////////////////////////////////////////////////////////////
+// Kernel 1 : fused scale, double, clamp (element-wise)
+/////////////////////////////////////////////////////////////////
+__global__ void scale_double_clamp_kernel(
+        const float* __restrict__ in,
+        float* __restrict__ out,
+        const float  scale,
+        const float  clamp_min,
+        const float  clamp_max,
+        const size_t size){
+    const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size){
+        float val = in[idx] * scale * 2.0f;
+        val       = fminf(fmaxf(val, clamp_min), clamp_max);
+        out[idx]  = val;
+    }
+}
+
+/////////////////////////////////////////////////////////////////
+// Kernel 2 : row-wise logsumexp + mish and final product
+/////////////////////////////////////////////////////////////////
+__global__ void row_logsumexp_mish_mul_kernel(
+        const float* __restrict__ in,
+        float*       __restrict__ out,
+        const int hidden){
+    const int row = blockIdx.x;          // one block per row
+    const int tid = threadIdx.x;
+    const int row_start = row * hidden;
+
+    // 1) max for numerical stability
+    float local_max = -FLT_MAX;
+    for (int idx = tid; idx < hidden; idx += blockDim.x){
+        float v = in[row_start + idx];
+        local_max = v > local_max ? v : local_max;
+    }
+    float max_val = blockReduceMax(local_max);
+
+    // 2) sum of exp(x - max)
+    float local_sum = 0.f;
+    for (int idx = tid; idx < hidden; idx += blockDim.x){
+        float v = in[row_start + idx];
+        local_sum += __expf(v - max_val);
+    }
+    float sum_exp = blockReduceSum(local_sum);
+
+    // 3) write result (only one thread needed)
+    if (tid == 0){
+        float lse = logf(sum_exp) + max_val;        // logsumexp
+        float softplus = log1pf(expf(lse));
+        float mish     = lse * tanhf(softplus);     // mish(lse)
+        out[row]       = lse * mish;                // final product
+    }
+}
+
+/////////////////////////////////////////////////////////////////
+// C++ dispatchers
+/////////////////////////////////////////////////////////////////
+torch::Tensor scale_double_clamp_cuda(torch::Tensor input,
+                                      float scale,
+                                      float clamp_min,
+                                      float clamp_max){
+    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
+    auto output = torch::empty_like(input);
+
+    const size_t N = input.numel();
+    const int block = 256;
+    const int grid  = (N + block - 1) / block;
+
+    scale_double_clamp_kernel<<<grid, block>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        scale,
+        clamp_min,
+        clamp_max,
+        N);
+    return output;
+}
+
+torch::Tensor row_logsumexp_mish_mul_cuda(torch::Tensor input){
+    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
+    TORCH_CHECK(input.dim() == 2, "input must be 2-D");
+
+    const int batch  = input.size(0);
+    const int hidden = input.size(1);
+
+    auto output = torch::empty({batch, 1}, input.options());
+
+    const int block = 256;                 // threads per row
+    row_logsumexp_mish_mul_kernel<<<batch, block>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        hidden);
+    return output;
+}
+"""
+
+# ------------------------------------------------------------------
+# C++ prototypes (needed for torch inline binding)
+# ------------------------------------------------------------------
+cpp_src = """
+torch::Tensor scale_double_clamp_cuda(torch::Tensor input,
+                                      float scale,
+                                      float clamp_min,
+                                      float clamp_max);
+
+torch::Tensor row_logsumexp_mish_mul_cuda(torch::Tensor input);
+"""
+
+# ------------------------------------------------------------------
+# Build / load extension
+# ------------------------------------------------------------------
+fusion_ops = load_inline(
+    name="fusion_ops",
+    cpp_sources=cpp_src,
+    cuda_sources=source,
+    functions=[
+        "scale_double_clamp_cuda",
+        "row_logsumexp_mish_mul_cuda",
+    ],
+    verbose=False,
+)
+
+# ------------------------------------------------------------------
+# PyTorch module that uses the custom kernels
+# ------------------------------------------------------------------
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_size,
+                 scale_factor, clamp_min, clamp_max):
+        super().__init__()
+        self.matmul = nn.Linear(input_size, hidden_size, bias=True).cuda()
+        self.scale_factor = float(scale_factor)
+        self.clamp_min = float(clamp_min)
+        self.clamp_max = float(clamp_max)
+
+    def forward(self, x):
+        x = self.matmul(x)
+        x = fusion_ops.scale_double_clamp_cuda(
+            x,
+            self.scale_factor,
+            self.clamp_min,
+            self.clamp_max,
+        )
+        x = fusion_ops.row_logsumexp_mish_mul_cuda(x)
+        return x

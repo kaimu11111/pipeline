@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "LayerNorm applied over channels instead of width axis",
+  "why_it_matters": "Reference normalizes last dim (spatial width); candidate permutes to channels-last, so means/variances differ, giving large output errors.",
+  "minimal_fix_hint": "drop permute; run LayerNorm on original tensor"
+}
+```

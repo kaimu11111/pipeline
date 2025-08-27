@@ -1,0 +1,120 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# ----------------------------------------------------------------------
+# CUDA implementation of channel–wise soft-max for 5-D NCDHW tensors
+# ----------------------------------------------------------------------
+source = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cfloat>
+#include <math.h>
+
+// ---------------------------------------------------------------------
+// CUDA kernel
+// ---------------------------------------------------------------------
+__global__ void softmax_channel_kernel(const float* __restrict__ in,
+                                       float*       __restrict__ out,
+                                       const int C,
+                                       const int DHW,
+                                       const int total_elements) {
+    const int linear_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (linear_idx >= total_elements) return;
+
+    // Decompose linear index into (n, d, h, w)
+    const int n           = linear_idx / DHW;
+    const int spatial_idx = linear_idx - n * DHW;
+
+    // Offset of the first channel for this (n, d, h, w) position
+    const int base_offset = n * C * DHW + spatial_idx;
+
+    const float* in_ptr  = in  + base_offset;
+    float*       out_ptr = out + base_offset;
+    const int    stride  = DHW;   // distance between successive channels
+
+    // 1) Find max value across C for numerical stability
+    float max_val = -FLT_MAX;
+    for (int c = 0; c < C; ++c)
+        max_val = fmaxf(max_val, in_ptr[c * stride]);
+
+    // 2) Compute exp(.) and their sum
+    float sum_exp = 0.0f;
+    for (int c = 0; c < C; ++c) {
+        const float e = expf(in_ptr[c * stride] - max_val);
+        out_ptr[c * stride] = e;          // store numerator temporarily
+        sum_exp += e;
+    }
+
+    // 3) Normalise
+    const float inv_sum = 1.0f / sum_exp;
+    for (int c = 0; c < C; ++c)
+        out_ptr[c * stride] *= inv_sum;
+}
+
+// ---------------------------------------------------------------------
+// C++ host wrapper
+// ---------------------------------------------------------------------
+torch::Tensor softmax_channel_cuda(torch::Tensor x) {
+    TORCH_CHECK(x.is_cuda(),        "Input must be on CUDA");
+    TORCH_CHECK(x.scalar_type() == torch::kFloat32,
+                "Only float32 tensors are supported");
+
+    auto y = torch::empty_like(x);
+
+    const int N    = x.size(0);
+    const int C    = x.size(1);
+    const int D    = x.size(2);
+    const int H    = x.size(3);
+    const int W    = x.size(4);
+    const int DHW  = D * H * W;
+    const int tot  = N * DHW;
+
+    const int blk  = 256;
+    const int grd  = (tot + blk - 1) / blk;
+
+    softmax_channel_kernel<<<grd, blk>>>(
+        x.data_ptr<float>(),
+        y.data_ptr<float>(),
+        C,
+        DHW,
+        tot);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess)
+        throw std::runtime_error(cudaGetErrorString(err));
+
+    return y;
+}
+"""
+
+# Prototypes for all exposed functions
+cpp_src = "torch::Tensor softmax_channel_cuda(torch::Tensor x);"
+
+# Build/Load extension
+softmax_cuda = load_inline(
+    name        = "softmax_channel",
+    cpp_sources = cpp_src,
+    cuda_sources= source,
+    functions   = ["softmax_channel_cuda"],
+    verbose     = False,
+)
+
+# ----------------------------------------------------------------------
+# Model that uses the custom CUDA soft-max
+# ----------------------------------------------------------------------
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, pool_kernel_size):
+        super().__init__()
+        self.conv  = nn.Conv3d(in_channels, out_channels, kernel_size)
+        self.pool1 = nn.MaxPool3d(pool_kernel_size)
+        self.pool2 = nn.MaxPool3d(pool_kernel_size)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = softmax_cuda.softmax_channel_cuda(x.contiguous())
+        x = self.pool1(x)
+        x = self.pool2(x)
+        return x
+```

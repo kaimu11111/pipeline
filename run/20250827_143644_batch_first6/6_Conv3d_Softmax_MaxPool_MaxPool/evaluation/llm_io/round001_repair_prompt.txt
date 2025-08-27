@@ -1,0 +1,173 @@
+You are a senior CUDA-extension developer.
+Your job is to **FIX** the compilation or runtime errors in the Python script
+shown below.
+
+OUTPUT RULES (STRICT) ────────────────────────────────────────────────
+1. Inside the block, follow **exactly** this order:
+   1. Imports – `torch`, `torch.nn`, `load_inline`.
+   2. `source` – triple‑quoted CUDA string(s) (kernel + host wrapper).
+   3. `cpp_src` – prototypes for *all* kernels you expose.
+   4. **One** `load_inline` call per kernel group.
+   5. `class ModelNew(nn.Module)` – mirrors original inputs/outputs but calls
+      your CUDA kernels.
+2. **Do NOT include** testing code, `if __name__ == "__main__"`, or extra prose.
+
+────────────────────────────────────────
+ERROR LOG
+────────────────────────────────────────
+/home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/utils/cpp_extension.py:2356: UserWarning: TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'].
+  warnings.warn(
+Error building extension 'softmax_channel': [1/3] c++ -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=softmax_channel -DTORCH_API_INCLUDE_EXTENSION_H -DPYBIND11_COMPILER_TYPE=\"_gcc\" -DPYBIND11_STDLIB=\"_libstdcpp\" -DPYBIND11_BUILD_ABI=\"_cxxabi1016\" -isystem /home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/include -isystem /home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/include/torch/csrc/api/include -isystem /home/wan00559/miniconda3/envs/maxk/include/python3.11 -D_GLIBCXX_USE_CXX11_ABI=1 -fPIC -std=c++17 -c /home/wan00559/.cache/torch_extensions/py311_cu126/softmax_channel/main.cpp -o main.o 
+[2/3] /usr/bin/nvcc --generate-dependencies-with-compile --dependency-output cuda.cuda.o.d -DTORCH_EXTENSION_NAME=softmax_channel -DTORCH_API_INCLUDE_EXTENSION_H -DPYBIND11_COMPILER_TYPE=\"_gcc\" -DPYBIND11_STDLIB=\"_libstdcpp\" -DPYBIND11_BUILD_ABI=\"_cxxabi1016\" -isystem /home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/include -isystem /home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/include/torch/csrc/api/include -isystem /home/wan00559/miniconda3/envs/maxk/include/python3.11 -D_GLIBCXX_USE_CXX11_ABI=1 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_75,code=compute_75 -gencode=arch=compute_75,code=sm_75 --compiler-options '-fPIC' -std=c++17 -c /home/wan00559/.cache/torch_extensions/py311_cu126/softmax_channel/cuda.cu -o cuda.cuda.o 
+[3/3] c++ main.o cuda.cuda.o -shared -L/home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/lib -lc10 -lc10_cuda -ltorch_cpu -ltorch_cuda -ltorch -ltorch_python -L/usr/lib64 -lcudart -o softmax_channel.so
+FAILED: softmax_channel.so 
+c++ main.o cuda.cuda.o -shared -L/home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/lib -lc10 -lc10_cuda -ltorch_cpu -ltorch_cuda -ltorch -ltorch_python -L/usr/lib64 -lcudart -o softmax_channel.so
+/usr/bin/ld: cuda.cuda.o: in function `PyInit_softmax_channel':
+tmpxft_003cd5ef_00000000-6_cuda.cudafe1.cpp:(.text+0x537): multiple definition of `PyInit_softmax_channel'; main.o:main.cpp:(.text+0x257): first defined here
+collect2: error: ld returned 1 exit status
+ninja: build stopped: subcommand failed.
+
+────────────────────────────────────────
+OLD CODE (read-only)
+────────────────────────────────────────
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# ----------------------------------------------------------------------
+# CUDA implementation of channel–wise soft-max for 5-D NCDHW tensors
+# ----------------------------------------------------------------------
+softmax_cuda_src = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cfloat>       // for FLT_MAX
+#include <math.h>
+
+////////////////////////////////////////////////////////////////////////////////
+// CUDA kernel
+////////////////////////////////////////////////////////////////////////////////
+__global__ void softmax_channel_kernel(const float* __restrict__ in,
+                                       float* __restrict__ out,
+                                       const int C,
+                                       const int DHW,
+                                       const int total_elements) {
+    int linear_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (linear_idx >= total_elements) return;
+
+    // Offset of the first channel for this (n, d, h, w) position
+    int base_offset = linear_idx;          // offset within one channel
+    const float* in_ptr  = in  + base_offset;
+    float*       out_ptr = out + base_offset;
+
+    // Step between successive channels (because layout is N C D H W, contiguous)
+    const int stride = DHW;
+
+    // 1) Find maximum value across C to improve numerical stability
+    float max_val = -FLT_MAX;
+    for (int c = 0; c < C; ++c) {
+        float v = in_ptr[c * stride];
+        max_val = v > max_val ? v : max_val;
+    }
+
+    // 2) Compute sum of exp(.) and store intermediate exp values to output
+    float sum_exp = 0.0f;
+    for (int c = 0; c < C; ++c) {
+        float e = expf(in_ptr[c * stride] - max_val);
+        out_ptr[c * stride] = e;           // Temporarily keep numerator
+        sum_exp += e;
+    }
+    float inv_sum = 1.0f / sum_exp;
+
+    // 3) Normalize
+    for (int c = 0; c < C; ++c) {
+        out_ptr[c * stride] *= inv_sum;
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// C++ interface
+////////////////////////////////////////////////////////////////////////////////
+torch::Tensor softmax_channel_cuda(torch::Tensor x) {
+    TORCH_CHECK(x.is_cuda(), "Tensor must reside on CUDA device");
+    TORCH_CHECK(x.scalar_type() == torch::kFloat32,
+                "Only float32 tensors are supported");
+
+    auto y = torch::empty_like(x);
+
+    const int N  = x.size(0);
+    const int C  = x.size(1);
+    const int D  = x.size(2);
+    const int H  = x.size(3);
+    const int W  = x.size(4);
+    const int DHW   = D * H * W;
+    const int total = N * DHW;
+
+    const int block_size = 256;
+    const int grid_size  = (total + block_size - 1) / block_size;
+
+    softmax_channel_kernel<<<grid_size, block_size>>>(
+        x.data_ptr<float>(),
+        y.data_ptr<float>(),
+        C,
+        DHW,
+        total);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess)
+        throw std::runtime_error(cudaGetErrorString(err));
+
+    return y;
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("softmax_channel_cuda", &softmax_channel_cuda,
+          "Channel-wise softmax for 5-D tensors (CUDA)");
+}
+"""
+
+# Exposed prototype for the function we just defined
+cpp_decl = "torch::Tensor softmax_channel_cuda(torch::Tensor x);"
+
+# Build the extension
+softmax_cuda = load_inline(
+    name="softmax_channel",
+    cpp_sources=cpp_decl,
+    cuda_sources=softmax_cuda_src,
+    functions=["softmax_channel_cuda"],
+    verbose=False,
+)
+
+# ----------------------------------------------------------------------
+# Optimised model using the custom CUDA soft-max
+# ----------------------------------------------------------------------
+class ModelNew(nn.Module):
+    """
+    Model that performs a 3D convolution, uses a custom CUDA
+    soft-max along the channel dimension, and applies two max-pool layers.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, pool_kernel_size):
+        super().__init__()
+        self.conv   = nn.Conv3d(in_channels, out_channels, kernel_size)
+        self.pool1  = nn.MaxPool3d(pool_kernel_size)
+        self.pool2  = nn.MaxPool3d(pool_kernel_size)
+
+    def forward(self, x):
+        x = self.conv(x)
+        # Custom CUDA soft-max (channel-wise)
+        x = softmax_cuda.softmax_channel_cuda(x.contiguous())
+        x = self.pool1(x)
+        x = self.pool2(x)
+        return x
+
+────────────────────────────────────────
+Main Critical Problem
+────────────────────────────────────────
+critical_issue: base_offset omits factor C for batch n>0
+why_it_matters: For n>0 each thread reads/writes data C·DHW elements earlier, mixing samples and yielding wrong soft-max values.
+minimal_fix_hint: add n*C*DHW when computing base_offset
+
+```python
+# <your corrected code>
+```
+# ==========================================================

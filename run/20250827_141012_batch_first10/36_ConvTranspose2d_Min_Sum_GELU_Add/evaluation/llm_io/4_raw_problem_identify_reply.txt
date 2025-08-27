@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Seventh positional arg (bias_shape tuple) wrongly passed as groups to ConvTranspose2d",
+  "why_it_matters": "groups expects int; tuple triggers TypeError, so ModelNew fails to instantiate, producing no outputs at all.",
+  "minimal_fix_hint": "Stop forwarding non-tensor trailing arg to ConvTranspose args."
+}
+```

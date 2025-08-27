@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "CUDA input but model layers still on CPU",
+  "why_it_matters": "Passing a GPU tensor into CPU-resident Conv3d/GroupNorm triggers a device mismatch error, so forward() fails completely.",
+  "minimal_fix_hint": "Move model to .cuda() or keep inputs on CPU"
+}
+```

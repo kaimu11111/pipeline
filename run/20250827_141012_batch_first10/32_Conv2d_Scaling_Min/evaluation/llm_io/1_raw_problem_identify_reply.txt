@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Conv2d in ModelNew adds padding that reference model lacks",
+  "why_it_matters": "Padding changes convolution receptive field and output spatial size, so all subsequent scaled-min results differ from reference.",
+  "minimal_fix_hint": "Create Conv2d with padding=0"
+}
+```

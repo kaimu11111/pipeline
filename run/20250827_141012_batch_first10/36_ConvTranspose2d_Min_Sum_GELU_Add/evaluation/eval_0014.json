@@ -1,0 +1,6 @@
+{
+  "runnable": false,
+  "phase": "repair",
+  "error_type": "RuntimeError",
+  "message": "Traceback (most recent call last):\n  File \"/home/wan00559/pipleline/utils/compile_and_run.py\", line 516, in compare_and_bench\n    test_model = ModelNew(*init_args, **init_kwargs)\n                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/wan00559/pipleline/run/20250827_141012_batch_first10/36_ConvTranspose2d_Min_Sum_GELU_Add/code/kernel_20250827_143920.py\", line 154, in __init__\n    self.conv_transpose = nn.ConvTranspose2d(*raw_args, **kwargs)\n                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/nn/modules/conv.py\", line 1127, in __init__\n    super().__init__(\n  File \"/home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/nn/modules/conv.py\", line 751, in __init__\n    super().__init__(\n  File \"/home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/nn/modules/conv.py\", line 104, in __init__\n    if groups <= 0:\n       ^^^^^^^^^^^\nTypeError: '<=' not supported between instances of 'tuple' and 'int'\n"
+}

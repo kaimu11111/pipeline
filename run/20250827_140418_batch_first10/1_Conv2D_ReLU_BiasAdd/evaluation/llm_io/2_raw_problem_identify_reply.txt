@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "bias grad multiplied by ReLU mask",
+  "why_it_matters": "Bias is added after ReLU, so its gradient should be sum(grad_out); masking removes contributions where pre-activation ≤0, giving wrong updates.",
+  "minimal_fix_hint": "atomicAdd(&grad_bias[c], grad_out[idx]);"
+}
+```

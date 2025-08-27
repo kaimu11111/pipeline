@@ -1,0 +1,113 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# --------------------------------------------------------------------
+# CUDA kernel: (x - bias) -> tanh, fused in a single pass
+# --------------------------------------------------------------------
+cuda_src = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+template <typename scalar_t>
+__global__ void bias_sub_tanh_kernel(const scalar_t* __restrict__ x,
+                                     const scalar_t* __restrict__ bias,
+                                     scalar_t* __restrict__ y,
+                                     const int total_elements,
+                                     const int C,
+                                     const int H,
+                                     const int W) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_elements) return;
+
+    // Extract channel index to pick the right bias element
+    const int c = (idx / (W * H)) % C;
+
+    const scalar_t val = x[idx] - bias[c];
+    const double t    = tanh(static_cast<double>(val));
+    y[idx]            = static_cast<scalar_t>(t);
+}
+
+torch::Tensor bias_sub_tanh_cuda(torch::Tensor x, torch::Tensor bias) {
+    x    = x.contiguous();
+    bias = bias.contiguous();
+
+    const int N = x.size(0);
+    const int C = x.size(1);
+    const int H = x.size(2);
+    const int W = x.size(3);
+
+    const int total = N * C * H * W;
+    auto y          = torch::empty_like(x);
+
+    const int threads = 256;
+    const int blocks  = (total + threads - 1) / threads;
+
+    AT_DISPATCH_FLOATING_TYPES(x.scalar_type(), "bias_sub_tanh_cuda", ([&] {
+        bias_sub_tanh_kernel<scalar_t><<<blocks, threads>>>(
+            x.data_ptr<scalar_t>(),
+            bias.data_ptr<scalar_t>(),
+            y.data_ptr<scalar_t>(),
+            total,
+            C, H, W);
+    }));
+    return y;
+}
+"""
+
+cpp_src = "torch::Tensor bias_sub_tanh_cuda(torch::Tensor x, torch::Tensor bias);"
+
+# Compile / load the inline extension
+_bias_tanh = load_inline(
+    name="bias_sub_tanh_extension",
+    cpp_sources=cpp_src,
+    cuda_sources=cuda_src,
+    functions=["bias_sub_tanh_cuda"],
+    verbose=False,
+)
+
+# --------------------------------------------------------------------
+# Optimised model using the fused CUDA kernel
+# --------------------------------------------------------------------
+class ModelNew(nn.Module):
+    """
+    Performs ConvTranspose2d, fused (x - bias) + tanh via custom CUDA.
+    """
+    def __init__(self,
+                 in_channels,
+                 out_channels,
+                 kernel_size,
+                 bias_shape,
+                 stride=2,
+                 padding=1,
+                 output_padding=1):
+        super().__init__()
+
+        self.conv_transpose = nn.ConvTranspose2d(
+            in_channels, out_channels, kernel_size,
+            stride=stride, padding=padding, output_padding=output_padding
+        )
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self._cuda_fused_op = _bias_tanh
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        x = self._cuda_fused_op.bias_sub_tanh_cuda(x, self.bias)
+        return x
+
+# --------------------------------------------------------------------
+# Helpers expected by the evaluation harness
+# --------------------------------------------------------------------
+batch_size  = 16
+in_channels = 32
+out_channels = 32
+height = width = 128
+kernel_size = 2
+bias_shape = (out_channels, 1, 1)
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width, device='cuda')]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, bias_shape]

@@ -117,7 +117,7 @@ Example:
 """
     )
 )
-system_prompt = """\
+default_system_prompt = """\
 You are a senior CUDA-kernel optimisation specialist. Your job is to generate a high-quality,
 compilable, and runnable Python script that builds and launches **hand-written CUDA kernels**.
 

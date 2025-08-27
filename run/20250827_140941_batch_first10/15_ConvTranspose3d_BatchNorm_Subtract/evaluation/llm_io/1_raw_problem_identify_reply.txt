@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "PyInit_subtract_mean defined twice",
+  "why_it_matters": "Duplicate PYBIND11_MODULE blocks linking, extension fails to build, model never runs vs. reference.",
+  "minimal_fix_hint": "Delete PyBind section in cuda_source"
+}
+```

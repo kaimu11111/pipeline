@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Duplicate PYBIND11_MODULE definition",
+  "why_it_matters": "load_inline auto-generates a module; manual PYBIND11_MODULE duplicates symbol, link fails, extension never builds.",
+  "minimal_fix_hint": "Delete manual PYBIND11_MODULE block"
+}
+```

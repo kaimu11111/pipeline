@@ -1,0 +1,7 @@
+task,best_score,best_runnable,task_dir,figure
+KernelBench/temp3/28_BMM_InstanceNorm_Sum_ResidualAdd_Multiply.py,1.053638,1,/home/wan00559/pipleline/run/20250827_144812_batch_first3/28_BMM_InstanceNorm_Sum_ResidualAdd_Multiply,/home/wan00559/pipleline/run/20250827_144812_batch_first3/28_BMM_InstanceNorm_Sum_ResidualAdd_Multiply/figures/28_BMM_InstanceNorm_Sum_ResidualAdd_Multiply_score.png
+KernelBench/temp3/29_Matmul_Mish_Mish.py,1.001238,1,/home/wan00559/pipleline/run/20250827_144812_batch_first3/29_Matmul_Mish_Mish,/home/wan00559/pipleline/run/20250827_144812_batch_first3/29_Matmul_Mish_Mish/figures/29_Matmul_Mish_Mish_score.png
+KernelBench/temp3/30_Gemm_GroupNorm_Hardtanh.py,0.999218,1,/home/wan00559/pipleline/run/20250827_144812_batch_first3/30_Gemm_GroupNorm_Hardtanh,/home/wan00559/pipleline/run/20250827_144812_batch_first3/30_Gemm_GroupNorm_Hardtanh/figures/30_Gemm_GroupNorm_Hardtanh_score.png
+
+avg_speedup,1.018031
+accuracy,1.000000

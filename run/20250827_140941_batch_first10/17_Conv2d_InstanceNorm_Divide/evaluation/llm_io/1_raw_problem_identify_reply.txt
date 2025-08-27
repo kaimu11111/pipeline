@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Two PYBIND11_MODULE definitions collide",
+  "why_it_matters": "Duplicate PyInit_fused_instancenorm_div symbols make linking fail, extension never builds, model cannot run at all.",
+  "minimal_fix_hint": "Delete PYBIND11_MODULE block from cuda_source"
+}
+```

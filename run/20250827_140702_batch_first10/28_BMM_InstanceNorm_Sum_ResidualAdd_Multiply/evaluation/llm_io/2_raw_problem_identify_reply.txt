@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Duplicate PYBIND11_MODULE creates two PyInit symbols",
+  "why_it_matters": "Linker aborts with “multiple definition of `PyInit_fused_instance_add_mul`”; extension never builds, so no outputs can match reference.",
+  "minimal_fix_hint": "Delete manual PYBIND11_MODULE or omit functions list."
+}
+```

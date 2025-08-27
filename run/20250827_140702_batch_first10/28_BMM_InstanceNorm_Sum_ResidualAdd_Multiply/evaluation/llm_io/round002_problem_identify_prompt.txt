@@ -1,0 +1,200 @@
+You are given:
+
+ERROR_LOG:
+/home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/utils/cpp_extension.py:2356: UserWarning: TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'].
+  warnings.warn(
+Error building extension 'fused_instance_add_mul': [1/3] c++ -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=fused_instance_add_mul -DTORCH_API_INCLUDE_EXTENSION_H -DPYBIND11_COMPILER_TYPE=\"_gcc\" -DPYBIND11_STDLIB=\"_libstdcpp\" -DPYBIND11_BUILD_ABI=\"_cxxabi1016\" -isystem /home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/include -isystem /home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/include/torch/csrc/api/include -isystem /home/wan00559/miniconda3/envs/maxk/include/python3.11 -D_GLIBCXX_USE_CXX11_ABI=1 -fPIC -std=c++17 -c /home/wan00559/.cache/torch_extensions/py311_cu126/fused_instance_add_mul/main.cpp -o main.o 
+[2/3] /usr/bin/nvcc --generate-dependencies-with-compile --dependency-output cuda.cuda.o.d -DTORCH_EXTENSION_NAME=fused_instance_add_mul -DTORCH_API_INCLUDE_EXTENSION_H -DPYBIND11_COMPILER_TYPE=\"_gcc\" -DPYBIND11_STDLIB=\"_libstdcpp\" -DPYBIND11_BUILD_ABI=\"_cxxabi1016\" -isystem /home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/include -isystem /home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/include/torch/csrc/api/include -isystem /home/wan00559/miniconda3/envs/maxk/include/python3.11 -D_GLIBCXX_USE_CXX11_ABI=1 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_75,code=compute_75 -gencode=arch=compute_75,code=sm_75 --compiler-options '-fPIC' -std=c++17 -c /home/wan00559/.cache/torch_extensions/py311_cu126/fused_instance_add_mul/cuda.cu -o cuda.cuda.o 
+[3/3] c++ main.o cuda.cuda.o -shared -L/home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/lib -lc10 -lc10_cuda -ltorch_cpu -ltorch_cuda -ltorch -ltorch_python -L/usr/lib64 -lcudart -o fused_instance_add_mul.so
+FAILED: fused_instance_add_mul.so 
+c++ main.o cuda.cuda.o -shared -L/home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/lib -lc10 -lc10_cuda -ltorch_cpu -ltorch_cuda -ltorch -ltorch_python -L/usr/lib64 -lcudart -o fused_instance_add_mul.so
+/usr/bin/ld: cuda.cuda.o: in function `PyInit_fused_instance_add_mul':
+tmpxft_003ccef9_00000000-6_cuda.cudafe1.cpp:(.text+0x64f): multiple definition of `PyInit_fused_instance_add_mul'; main.o:main.cpp:(.text+0x257): first defined here
+collect2: error: ld returned 1 exit status
+ninja: build stopped: subcommand failed.
+
+PyTorch reference (ground truth):
+
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Model that performs a batch matrix multiplication, instance normalization, summation, residual addition, and multiplication.
+    """
+    def __init__(self, in_features, out_features, eps=1e-5, momentum=0.1):
+        super(Model, self).__init__()
+        self.bmm = nn.Linear(in_features, out_features)
+        self.instance_norm = nn.InstanceNorm2d(out_features, eps=eps, momentum=momentum)
+
+    def forward(self, x, y):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_features).
+            y (torch.Tensor): Input tensor of shape (batch_size, out_features).
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, out_features).
+        """
+        x = self.bmm(x)
+        x = self.instance_norm(x.unsqueeze(1).unsqueeze(1)).squeeze(1).squeeze(1)
+        x = x + y
+        x = x * y
+        return x
+
+batch_size = 512  # Increased batch size
+in_features = 4096  # Increased input features
+out_features = 4096  # Increased output features
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features), torch.rand(batch_size, out_features)]
+
+def get_init_inputs():
+    return [in_features, out_features]
+
+CUDA candidate (to audit):
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+
+CUDA_SRC = r"""
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <torch/extension.h>
+
+/* -------------------------------------------------------------------------
+   Kernel:  fused_instance_norm_add_mul
+            1) Instance-normalise per (batch, channel) over remaining dims
+            2) out = (norm(x) + y) * y
+   ------------------------------------------------------------------------- */
+__global__ void fused_kernel(const float* __restrict__ x,
+                             const float* __restrict__ y,
+                             float* __restrict__ out,
+                             const int64_t C,
+                             const int64_t S,
+                             const float   eps)
+{
+    extern __shared__ float sdata[];
+    float* s_sum    = sdata;                 // [blockDim.x]
+    float* s_sum_sq = sdata + blockDim.x;    // [blockDim.x]
+
+    const int n   = blockIdx.y;              // batch index
+    const int c   = blockIdx.x;              // channel index
+    const int tid = threadIdx.x;
+    const int T   = blockDim.x;
+
+    const int64_t base = (static_cast<int64_t>(n) * C + c) * S;
+
+    // ------------------------------------------------------------------ //
+    // 1) mean / variance over S values
+    float local_sum    = 0.f;
+    float local_sum_sq = 0.f;
+
+    for (int64_t s = tid; s < S; s += T) {
+        const float v = x[base + s];
+        local_sum    += v;
+        local_sum_sq += v * v;
+    }
+    s_sum[tid]    = local_sum;
+    s_sum_sq[tid] = local_sum_sq;
+    __syncthreads();
+
+    // parallel reduction
+    for (int off = T >> 1; off > 0; off >>= 1) {
+        if (tid < off) {
+            s_sum[tid]    += s_sum[tid + off];
+            s_sum_sq[tid] += s_sum_sq[tid + off];
+        }
+        __syncthreads();
+    }
+
+    const float mean   = s_sum[0] / static_cast<float>(S);
+    const float var    = s_sum_sq[0] / static_cast<float>(S) - mean * mean;
+    const float invStd = rsqrtf(var + eps);
+
+    // ------------------------------------------------------------------ //
+    // 2) normalise + add + mul
+    for (int64_t s = tid; s < S; s += T) {
+        const float xn   = (x[base + s] - mean) * invStd;
+        const float valY = y[base + s];
+        out[base + s]    = (xn + valY) * valY;
+    }
+}
+
+/* --------------------------------------------------------------------- */
+torch::Tensor fused_forward(torch::Tensor x,
+                            torch::Tensor y,
+                            const float   eps)
+{
+    TORCH_CHECK(x.is_cuda() && y.is_cuda(), "inputs must be CUDA tensors");
+    TORCH_CHECK(x.dtype() == torch::kFloat32 && y.dtype() == torch::kFloat32,
+                "inputs must be float32");
+    TORCH_CHECK(x.sizes() == y.sizes(), "x and y must have identical shapes");
+
+    x = x.contiguous();
+    y = y.contiguous();
+
+    const int64_t N = x.size(0);
+    const int64_t C = x.size(1);
+
+    int64_t S = 1;
+    for (int i = 2; i < x.dim(); ++i) S *= x.size(i);   // spatial size
+
+    auto out = torch::empty_like(x);
+
+    const int threads = 256;
+    const dim3 grid(static_cast<unsigned int>(C),
+                    static_cast<unsigned int>(N));
+    const size_t shmem = threads * sizeof(float) * 2;
+
+    fused_kernel<<<grid, threads, shmem>>>(x.data_ptr<float>(),
+                                           y.data_ptr<float>(),
+                                           out.data_ptr<float>(),
+                                           C, S, eps);
+    return out;
+}
+
+/* --------------------------------------------------------------------- */
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("fused_forward", &fused_forward,
+          "Fused instance-norm + add + mul (CUDA)");
+}
+"""
+
+cpp_src = r"""
+#include <torch/extension.h>
+
+// Forward declaration needed for the generated binding code
+torch::Tensor fused_forward(torch::Tensor x,
+                            torch::Tensor y,
+                            const float   eps);
+"""
+
+_fused = load_inline(
+    name="fused_instance_add_mul",
+    cpp_sources=cpp_src,
+    cuda_sources=CUDA_SRC,
+    functions=["fused_forward"],
+    verbose=False,
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Linear  ->  fused(instance_norm + add + mul)
+    """
+    def __init__(self, in_features, out_features, eps=1e-5):
+        super().__init__()
+        self.linear = nn.Linear(in_features, out_features, bias=True)
+        self.eps = eps
+
+    def forward(self, x, y):
+        x = self.linear(x).contiguous().cuda()
+        y = y.contiguous().cuda()
+        return _fused.fused_forward(x, y, self.eps)
+
+
+Follow the Rules and produce the JSON exactly in the specified format.

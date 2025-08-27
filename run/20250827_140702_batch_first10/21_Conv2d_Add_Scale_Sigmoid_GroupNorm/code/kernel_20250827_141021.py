@@ -1,0 +1,121 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# ---------------------------------------------------------------------
+# CUDA kernel + host wrapper (NO PYBIND11_MODULE here!)
+# ---------------------------------------------------------------------
+source = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+template <typename scalar_t>
+__global__ void fused_bias_scale_sigmoid_kernel(
+        const scalar_t* __restrict__ x,
+        const scalar_t* __restrict__ bias,
+        const scalar_t* __restrict__ scale,
+        scalar_t* __restrict__ out,
+        int elements,
+        int C,
+        int HW)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= elements) return;
+
+    int c = (idx / HW) % C;
+
+    scalar_t val   = x[idx];
+    scalar_t b_val = bias[c];
+    scalar_t s_val = scale[c];
+
+    scalar_t t = (val + b_val) * s_val;
+    out[idx] = static_cast<scalar_t>(1) /
+               (static_cast<scalar_t>(1) + expf(-t));
+}
+
+/* ------------------------------------------------------------------ */
+/* Host-facing wrapper                                                 */
+/* ------------------------------------------------------------------ */
+torch::Tensor fused_bias_scale_sigmoid_cuda(torch::Tensor x,
+                                            torch::Tensor bias,
+                                            torch::Tensor scale)
+{
+    TORCH_CHECK(x.is_cuda(),    "x must be CUDA");
+    TORCH_CHECK(bias.is_cuda(), "bias must be CUDA");
+    TORCH_CHECK(scale.is_cuda(),"scale must be CUDA");
+    TORCH_CHECK(x.dtype() == torch::kFloat32, "only float32 supported");
+
+    const int64_t N  = x.size(0);
+    const int64_t C  = x.size(1);
+    const int64_t H  = x.size(2);
+    const int64_t W  = x.size(3);
+    const int64_t HW = H * W;
+    const int64_t elements = x.numel();
+
+    TORCH_CHECK(bias.numel()  == C, "bias numel must equal channels");
+    TORCH_CHECK(scale.numel() == C, "scale numel must equal channels");
+
+    auto out = torch::empty_like(x);
+
+    const int threads = 256;
+    const int blocks  = (elements + threads - 1) / threads;
+
+    fused_bias_scale_sigmoid_kernel<float>
+        <<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+            x.data_ptr<float>(),
+            bias.data_ptr<float>(),
+            scale.data_ptr<float>(),
+            out.data_ptr<float>(),
+            static_cast<int>(elements),
+            static_cast<int>(C),
+            static_cast<int>(HW));
+
+    return out;
+}
+"""
+
+# ---------------------------------------------------------------------
+# C++ prototypes
+# ---------------------------------------------------------------------
+cpp_src = r"""
+torch::Tensor fused_bias_scale_sigmoid_cuda(torch::Tensor x,
+                                            torch::Tensor bias,
+                                            torch::Tensor scale);
+"""
+
+# ---------------------------------------------------------------------
+# Build & load
+# ---------------------------------------------------------------------
+fused_bias_scale_sigmoid = load_inline(
+    name="fused_bias_scale_sigmoid",
+    cpp_sources=cpp_src,
+    cuda_sources=source,
+    functions=["fused_bias_scale_sigmoid_cuda"],
+    verbose=False,
+)
+
+# ---------------------------------------------------------------------
+# Optimised model wrapper
+# ---------------------------------------------------------------------
+class ModelNew(nn.Module):
+    """
+    Conv2D ➔ fused (bias + scale + sigmoid) ➔ GroupNorm
+    """
+    def __init__(self, in_channels, out_channels, kernel_size,
+                 num_groups, bias_shape, scale_shape):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)  # no padding
+        self.bias  = nn.Parameter(torch.randn(bias_shape))
+        self.scale = nn.Parameter(torch.randn(scale_shape))
+        self.group_norm = nn.GroupNorm(num_groups, out_channels)
+
+    def forward(self, x):
+        x = self.conv(x)
+        bias_flat  = self.bias.view(-1).contiguous()
+        scale_flat = self.scale.view(-1).contiguous()
+        x = fused_bias_scale_sigmoid.fused_bias_scale_sigmoid_cuda(
+                x, bias_flat, scale_flat)
+        x = self.group_norm(x)
+        return x

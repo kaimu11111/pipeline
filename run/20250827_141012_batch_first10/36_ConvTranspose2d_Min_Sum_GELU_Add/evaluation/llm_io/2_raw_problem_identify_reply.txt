@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "ModelNew.__init__ expects (conv,bias) not 7 hyper-params",
+  "why_it_matters": "Benchmark supplies 7 scalar init args; TypeError stops instantiation, so no output to compare with reference.",
+  "minimal_fix_hint": "Make __init__(in_ch,out_ch,kernel,…) like reference."
+}
+```

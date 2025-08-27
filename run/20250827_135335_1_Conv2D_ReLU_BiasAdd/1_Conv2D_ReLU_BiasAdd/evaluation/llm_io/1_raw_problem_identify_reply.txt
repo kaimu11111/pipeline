@@ -1,0 +1,5 @@
+{
+  "critical_issue": "Bias is added before ReLU, not after",
+  "why_it_matters": "Reference computes y=ReLU(conv(x))+bias; kernel computes ReLU(conv(x)+bias), altering activation distribution and output values significantly.",
+  "minimal_fix_hint": "Split kernel or reorder: ReLU then add bias"
+}

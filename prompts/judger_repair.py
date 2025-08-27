@@ -70,10 +70,11 @@ Follow the Rules and produce the JSON exactly in the specified format."""
 # -----------------------------
 # Build both at once (returns tuple)
 # -----------------------------
-def build_correctness_prompts(*, error_log: str, pytorch_code: str, cuda_code: str):
+def build_correctness_prompts(*, error_log: str, arch_path: Path, cuda_code: str):
     """
     Return (system_prompt_str, instruction_str).
     """
+    pytorch_code = Path(arch_path).read_text().strip()
     system_prompt = system_prompt_tmpl.substitute()
     instruction = instruction_tmpl.substitute(
         ERROR_LOG=error_log.strip(),

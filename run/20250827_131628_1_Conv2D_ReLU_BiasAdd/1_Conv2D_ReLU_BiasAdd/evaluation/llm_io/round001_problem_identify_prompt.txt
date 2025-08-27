@@ -1,0 +1,147 @@
+You are given:
+
+ERROR_LOG:
+Traceback (most recent call last):
+  File "/home/wan00559/pipleline/utils/compile_and_run.py", line 541, in compare_and_bench
+    raise ValueError(
+ValueError: Outputs are not close (atol=0.001, rtol=0.001). max_abs_err=2.801e+00, mean_abs_err=3.373e-01
+
+PyTorch reference (ground truth):
+
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs a convolution, applies ReLU, and adds a bias term.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, bias_shape):
+        super(Model, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.bias = nn.Parameter(torch.randn(bias_shape)) 
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = torch.relu(x)
+        x = x + self.bias
+        return x
+
+batch_size = 32
+in_channels  = 32 
+out_channels = 64  
+height = width = 64
+kernel_size = 3
+bias_shape = (out_channels, 1, 1)
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, bias_shape]
+
+CUDA candidate (to audit):
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# ---------------------------------------------------------------------
+# Inline CUDA implementation that fuses bias–addition + ReLU
+# ---------------------------------------------------------------------
+cuda_src = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+namespace {
+
+__global__ void add_bias_relu_kernel(const float* __restrict__ x,
+                                     const float* __restrict__ bias,
+                                     float* __restrict__ out,
+                                     int total_elems,
+                                     int stride_ch) {
+    // total_elems = B * C * H * W
+    // stride_ch   = H * W           (distance between successive channels)
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_elems) return;
+
+    // Compute channel index from flattened idx
+    int ch = (idx / stride_ch) % gridDim.y;  // gridDim.y == channels
+    float val = x[idx] + bias[ch];
+    out[idx] = val > 0.0f ? val : 0.0f;
+}
+
+} // anonymous namespace
+
+torch::Tensor add_bias_relu_cuda(torch::Tensor x, torch::Tensor bias) {
+    TORCH_CHECK(x.is_cuda(),  "Input tensor must be on CUDA device");
+    TORCH_CHECK(bias.is_cuda(), "Bias tensor must be on CUDA device");
+    TORCH_CHECK(x.dtype() == torch::kFloat32, "Only float32 supported");
+    TORCH_CHECK(bias.dtype() == torch::kFloat32, "Only float32 supported");
+
+    // Ensure contiguity
+    x = x.contiguous();
+    bias = bias.contiguous();
+
+    const int B = x.size(0);
+    const int C = x.size(1);
+    const int H = x.size(2);
+    const int W = x.size(3);
+    const int total = B * C * H * W;
+    const int stride_ch = H * W;
+
+    auto out = torch::empty_like(x);
+
+    const int threads = 256;
+    const int blocks  = (total + threads - 1) / threads;
+
+    // We pass C via gridDim.y to avoid extra kernel params while keeping registers low
+    dim3 grid(blocks, C);
+    add_bias_relu_kernel<<<grid, threads>>>(
+        x.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        out.data_ptr<float>(),
+        total,
+        stride_ch);
+
+    return out;
+}
+
+TORCH_LIBRARY(my_ops, m) {
+    m.def("add_bias_relu_cuda(Tensor x, Tensor bias) -> Tensor");
+}
+
+"""
+
+cpp_decl = "torch::Tensor add_bias_relu_cuda(torch::Tensor x, torch::Tensor bias);"
+
+# Compile and load the extension
+add_bias_relu_mod = load_inline(
+    name="add_bias_relu_fused",
+    cpp_sources=cpp_decl,
+    cuda_sources=cuda_src,
+    functions=["add_bias_relu_cuda"],
+    verbose=False,
+)
+
+# ---------------------------------------------------------------------
+# Optimised model definition
+# ---------------------------------------------------------------------
+class ModelNew(nn.Module):
+    """
+    Fused version of the original Model.
+    Replaces the separate ReLU and bias-addition with one CUDA kernel.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, bias_shape):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        # Bias kept identical to original shape (C, 1, 1)
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.add_bias_relu_cuda = add_bias_relu_mod.add_bias_relu_cuda
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.add_bias_relu_cuda(x, self.bias)
+        return x
+
+
+Follow the Rules and produce the JSON exactly in the specified format.

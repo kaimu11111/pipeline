@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "blockReduceMax doesn’t broadcast final max to all threads",
+  "why_it_matters": "Most threads use incorrect max when computing exp(x-max), so row logsumexp (and downstream Mish/product) is wrong.",
+  "minimal_fix_hint": "after final max, write to shared[0] then __syncthreads and read for all threads"
+}
+```

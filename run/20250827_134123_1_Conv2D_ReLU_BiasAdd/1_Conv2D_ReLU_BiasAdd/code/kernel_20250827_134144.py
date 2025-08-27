@@ -1,0 +1,107 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# ---------------------------------------------------------------------
+# Compile a fused CUDA kernel that applies ReLU and adds a (C, 1, 1) bias
+# ---------------------------------------------------------------------
+cuda_src = r"""
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+template <typename scalar_t>
+__global__ void relu_bias_kernel(const scalar_t* __restrict__ input,
+                                 const scalar_t* __restrict__ bias,
+                                 scalar_t* __restrict__ output,
+                                 int C, int H, int W,
+                                 int total_elements) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_elements) return;
+
+    int hw = H * W;
+    int c  = (idx / hw) % C;
+
+    scalar_t val = input[idx];
+    val = val > static_cast<scalar_t>(0) ? val : static_cast<scalar_t>(0);
+    output[idx] = val + bias[c];
+}
+
+torch::Tensor relu_bias_forward_cuda(torch::Tensor input,
+                                     torch::Tensor bias) {
+    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
+    TORCH_CHECK(bias.is_cuda(),  "bias must be a CUDA tensor");
+
+    input = input.contiguous();
+    bias  = bias.view({-1}).contiguous();  // (C,)
+    auto output = torch::empty_like(input);
+
+    const int N = input.size(0);
+    const int C = input.size(1);
+    const int H = input.size(2);
+    const int W = input.size(3);
+    const int total = input.numel();
+
+    const int threads = 256;
+    const int blocks  = (total + threads - 1) / threads;
+
+    AT_DISPATCH_FLOATING_TYPES(input.scalar_type(),
+                               "relu_bias_forward_cuda",
+                               ([&] {
+        relu_bias_kernel<scalar_t><<<blocks, threads>>>(
+            input.data_ptr<scalar_t>(),
+            bias.data_ptr<scalar_t>(),
+            output.data_ptr<scalar_t>(),
+            C, H, W, total);
+    }));
+
+    return output;
+}
+"""
+
+cpp_decl = """
+torch::Tensor relu_bias_forward_cuda(torch::Tensor input,
+                                     torch::Tensor bias);
+"""
+
+relu_bias = load_inline(
+    name="relu_bias",
+    cpp_sources=cpp_decl,
+    cuda_sources=cuda_src,
+    functions=["relu_bias_forward_cuda"],
+    verbose=False,
+)
+
+# ---------------------------------------------------------------------
+# Optimized model using the fused CUDA kernel
+# ---------------------------------------------------------------------
+class ModelNew(nn.Module):
+    """
+    Model that performs Conv2d followed by a fused ReLU + bias-add
+    implemented with a custom CUDA kernel.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, bias_shape):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, padding=kernel_size // 2)
+        self.bias = nn.Parameter(torch.randn(bias_shape))  # shape: (C, 1, 1)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = relu_bias.relu_bias_forward_cuda(x, self.bias)
+        return x
+
+# ---------------------------------------------------------------------
+# Helper functions to keep the same API as the original script
+# ---------------------------------------------------------------------
+batch_size  = 32
+in_channels = 32
+out_channels = 64
+height = width = 64
+kernel_size = 3
+bias_shape = (out_channels, 1, 1)
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width).cuda()]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, bias_shape]

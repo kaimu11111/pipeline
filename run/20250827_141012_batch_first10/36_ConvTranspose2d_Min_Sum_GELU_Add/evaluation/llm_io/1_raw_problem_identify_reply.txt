@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "ModelNew uses fresh random parameters",
+  "why_it_matters": "Conv-transpose weights and bias differ from reference model, so outputs diverge regardless of kernel correctness.",
+  "minimal_fix_hint": "Load/copy reference params into ModelNew before comparison"
+}
+```

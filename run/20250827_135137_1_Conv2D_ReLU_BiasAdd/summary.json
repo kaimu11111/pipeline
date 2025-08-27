@@ -1,0 +1,15 @@
+{
+  "avg_speedup": 1.07545554367148,
+  "accuracy": 1.0,
+  "num_tasks": 1,
+  "tasks": [
+    {
+      "task": "KernelBench/level2test/1_Conv2D_ReLU_BiasAdd.py",
+      "best_score": 1.07545554367148,
+      "best_runnable": true,
+      "task_dir": "/home/wan00559/pipleline/run/20250827_135137_1_Conv2D_ReLU_BiasAdd/1_Conv2D_ReLU_BiasAdd",
+      "figure": "/home/wan00559/pipleline/run/20250827_135137_1_Conv2D_ReLU_BiasAdd/1_Conv2D_ReLU_BiasAdd/figures/1_Conv2D_ReLU_BiasAdd_score.png"
+    }
+  ],
+  "timestamp": "2025-08-27 13:53:15"
+}

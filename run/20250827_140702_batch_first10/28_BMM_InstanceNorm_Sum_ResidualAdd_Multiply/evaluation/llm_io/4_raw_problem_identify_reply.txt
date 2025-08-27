@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Kernel treats 2-D input so S=1, giving zero variance",
+  "why_it_matters": "With var≈0 each x is normalised to 0, so output becomes y² instead of (norm(x)+y)*y, causing large errors.",
+  "minimal_fix_hint": "Reshape to N,C,H,W (H*W>1) or include feature dim in S reduction."
+}
+```

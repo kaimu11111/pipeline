@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Implements tanh-approx GELU, but reference uses exact GELU",
+  "why_it_matters": "Approximate formula shifts outputs; observed max_abs_err 3e-3 exceeds 1e-3 tolerance, diverging model behaviour and gradients.",
+  "minimal_fix_hint": "Switch to exact GELU formula or enable PyTorch approximate='tanh'."
+}
+```

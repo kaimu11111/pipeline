@@ -1,0 +1,165 @@
+You are given:
+
+ERROR_LOG:
+Traceback (most recent call last):
+  File "/home/wan00559/pipleline/utils/compile_and_run.py", line 536, in compare_and_bench
+    diff = (test_out - ref_out).abs()
+            ~~~~~~~~~^~~~~~~~~
+RuntimeError: The size of tensor a (128) must match the size of tensor b (126) at non-singleton dimension 3
+
+PyTorch reference (ground truth):
+
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs a convolution, applies Mish, and another Mish.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size):
+        super(Model, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = torch.nn.functional.mish(x)
+        x = torch.nn.functional.mish(x)
+        return x
+
+batch_size   = 32  
+in_channels  = 32  
+out_channels = 64  
+height = width = 128
+kernel_size = 3
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size]
+
+CUDA candidate (to audit):
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# -------------------------------------------------------------------------------
+# Inline CUDA kernel that fuses two consecutive Mish activations into one pass
+#     y = mish(mish(x))   where mish(z) = z * tanh(softplus(z))
+# -------------------------------------------------------------------------------
+cuda_src = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cmath>
+
+// ---------------------------------------------
+// Numerically–stable Softplus implementation
+// ---------------------------------------------
+template <typename scalar_t>
+__device__ __forceinline__ scalar_t softplus(const scalar_t x)
+{
+    const scalar_t threshold = static_cast<scalar_t>(20.0);
+    if (x > threshold)         return x;                       // log(1+e^x) ~= x
+    else if (x < -threshold)   return expf(x);                 // log(1+e^x) ~= e^x
+    else                       return log1pf(expf(x));         // stable log(1+e^x)
+}
+
+// ---------------------------------------------
+// Mish activation:  x * tanh(softplus(x))
+// ---------------------------------------------
+template <typename scalar_t>
+__device__ __forceinline__ scalar_t mish(const scalar_t x)
+{
+    return x * tanhf(softplus<scalar_t>(x));
+}
+
+// ---------------------------------------------
+// Fused kernel: y = mish(mish(x))
+// ---------------------------------------------
+template <typename scalar_t>
+__global__ void fused_double_mish_kernel(const scalar_t* __restrict__ inp,
+                                         scalar_t* __restrict__ out,
+                                         size_t N)
+{
+    const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < N)
+    {
+        scalar_t v = inp[idx];
+        v = mish<scalar_t>(v);     // first Mish
+        v = mish<scalar_t>(v);     // second Mish
+        out[idx] = v;
+    }
+}
+
+// ---------------------------------------------
+// C++/CUDA launcher
+// ---------------------------------------------
+torch::Tensor fused_double_mish(torch::Tensor x)
+{
+    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
+    TORCH_CHECK(x.scalar_type() == at::kFloat,
+                "Only float32 tensors are currently supported");
+
+    const auto N      = static_cast<size_t>(x.numel());
+    const int  blocks = (N + 255) / 256;
+    const int  threads= 256;
+
+    auto y = torch::empty_like(x);
+
+    fused_double_mish_kernel<float><<<blocks, threads>>>(
+        x.data_ptr<float>(),
+        y.data_ptr<float>(),
+        N);
+
+    return y;
+}
+"""
+
+cpp_hdr = "torch::Tensor fused_double_mish(torch::Tensor x);"
+
+# Compile the CUDA extension (done at first import – cached afterwards)
+fused_ext = load_inline(
+    name="fused_double_mish_ext",
+    cpp_sources=cpp_hdr,
+    cuda_sources=cuda_src,
+    functions=["fused_double_mish"],
+    verbose=False,
+)
+
+
+# -------------------------------------------------------------------------------
+# Optimised model leveraging the fused double-Mish CUDA kernel
+# -------------------------------------------------------------------------------
+class ModelNew(nn.Module):
+    """
+    Conv2d  ➔  fused mish(mish(·))
+    """
+    def __init__(self, in_channels, out_channels, kernel_size):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, padding=kernel_size//2)
+        self._mish = fused_ext  # holds the compiled CUDA op
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self._mish.fused_double_mish(x)
+        return x
+
+
+# -------------------------------------------------------------------------------
+# Helper functions (kept identical to the original file signature)
+# -------------------------------------------------------------------------------
+batch_size   = 32
+in_channels  = 32
+out_channels = 64
+height = width = 128
+kernel_size = 3
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width, device="cuda")]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size]
+
+
+Follow the Rules and produce the JSON exactly in the specified format.

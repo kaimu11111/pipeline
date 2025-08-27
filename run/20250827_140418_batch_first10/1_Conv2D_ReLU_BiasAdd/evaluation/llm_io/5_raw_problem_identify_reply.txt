@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Extra bias parameter wrongly initialized to zeros",
+  "why_it_matters": "Reference adds a randomly-initialized bias; zeroing it changes every forward output, giving large absolute errors.",
+  "minimal_fix_hint": "use torch.randn for self.bias init"
+}
+```

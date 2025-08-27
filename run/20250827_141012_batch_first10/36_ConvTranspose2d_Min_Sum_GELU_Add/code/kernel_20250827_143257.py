@@ -1,0 +1,186 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# ────────────────────────────────────────────────────────────────────────
+# CUDA kernel + C++ wrapper
+# ────────────────────────────────────────────────────────────────────────
+source = r"""
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+////////////////////////////////////////////////////////////////////////////////
+// fast-GELU (tanh approximation, same as torch.nn.functional.gelu(…,approx="tanh"))
+////////////////////////////////////////////////////////////////////////////////
+__device__ __forceinline__ float gelu(float x) {
+    const float kAlpha = 0.7978845608f;          // sqrt(2/pi)
+    const float kBeta  = 0.044715f;
+    return 0.5f * x * (1.f + tanhf(kAlpha * (x + kBeta * x * x * x)));
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// kernel:  (N,C,H,W)  ─►  (N,1,1,W)
+//          step1 : min along C
+//          step2 : sum along H
+//          step3 : GELU
+//          step4 : add bias (length = W)
+////////////////////////////////////////////////////////////////////////////////
+__global__ void fused_kernel(
+        const float* __restrict__ x,
+        const float* __restrict__ bias,
+        float*       __restrict__ out,
+        int N, int C, int H, int W)
+{
+    const int linear_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int nW = N * W;
+    if (linear_idx >= nW) return;
+
+    const int n = linear_idx / W;   // batch index
+    const int w = linear_idx % W;   // width  index
+
+    float sum_h = 0.f;
+
+    // iterate over height
+    for (int h = 0; h < H; ++h) {
+        // start with channel 0
+        int offset = (((n * C + 0) * H + h) * W) + w;
+        float min_val = x[offset];
+
+        // min over remaining channels
+        for (int c = 1; c < C; ++c) {
+            offset += H * W;            // stride of C is H*W
+            float v = x[offset];
+            if (v < min_val) min_val = v;
+        }
+        sum_h += min_val;
+    }
+
+    const float val = gelu(sum_h) + bias[w];   // bias is length-W vector
+    out[n * W + w] = val;                      // output is (N,1,1,W) contiguous
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// C++ interface
+////////////////////////////////////////////////////////////////////////////////
+torch::Tensor fused_min_sum_gelu_bias_cuda(torch::Tensor x,
+                                           torch::Tensor bias) {
+    TORCH_CHECK(x.is_cuda() , "x must be a CUDA tensor");
+    TORCH_CHECK(bias.is_cuda(), "bias must be a CUDA tensor");
+    TORCH_CHECK(x.dtype() == torch::kFloat32 , "x must be float32");
+    TORCH_CHECK(bias.dtype() == torch::kFloat32 , "bias must be float32");
+    TORCH_CHECK(bias.dim() == 1 , "bias must be 1-D (length = W)");
+    TORCH_CHECK(x.size(3) == bias.size(0),
+                "bias size (W) must match x.size(3)");
+
+    const int N = x.size(0);
+    const int C = x.size(1);
+    const int H = x.size(2);
+    const int W = x.size(3);
+
+    auto out = torch::empty({N,1,1,W}, x.options());
+
+    const int threads = 256;
+    const int blocks  = (N * W + threads - 1) / threads;
+
+    fused_kernel<<<blocks, threads>>>(
+        x.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        out.data_ptr<float>(),
+        N, C, H, W);
+
+    cudaError_t err = cudaGetLastError();
+    TORCH_CHECK(err == cudaSuccess, cudaGetErrorString(err));
+
+    return out;
+}
+"""
+
+# ────────────────────────────────────────────────────────────────────────
+# C++ prototypes
+# ────────────────────────────────────────────────────────────────────────
+cpp_src = r"""
+torch::Tensor fused_min_sum_gelu_bias_cuda(torch::Tensor x,
+                                           torch::Tensor bias);
+"""
+
+# ────────────────────────────────────────────────────────────────────────
+# Compile & load
+# ────────────────────────────────────────────────────────────────────────
+fused_ops = load_inline(
+    name        = "fused_min_sum_gelu_bias",
+    cpp_sources = cpp_src,
+    cuda_sources= source,
+    functions   = ["fused_min_sum_gelu_bias_cuda"],
+    verbose     = False,
+)
+
+# ────────────────────────────────────────────────────────────────────────
+# Python wrapper module
+# ────────────────────────────────────────────────────────────────────────
+class ModelNew(nn.Module):
+    """
+    Optimised replacement for the reference model.
+
+    Construction patterns supported
+    --------------------------------
+    1) ModelNew(ref_conv, ref_bias)
+       ‑ `ref_conv` : pre-built nn.ConvTranspose2d whose weights/bias are cloned
+       ‑ `ref_bias` : 1-D tensor (length=W) for the fused op
+
+    2) ModelNew( …convtranspose2d_args…, bias_tensor, **convtranspose2d_kwargs )
+       ‑ last positional arg **must** be the 1-D bias tensor
+       ‑ remaining args/kwargs are forwarded to nn.ConvTranspose2d
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+
+        # ── branch 1 : first arg is a ready ConvTranspose2d ─────────────────
+        if len(args) >= 1 and isinstance(args[0], nn.ConvTranspose2d):
+            ref_conv = args[0]
+            if len(args) < 2:
+                raise ValueError("Bias tensor missing (expected after ref_conv).")
+            ref_bias = args[1]
+            if not isinstance(ref_bias, torch.Tensor) or ref_bias.dim() != 1:
+                raise TypeError("ref_bias must be a 1-D torch.Tensor.")
+
+            # Clone the ConvTranspose2d so hyper-params & weights match
+            self.conv_transpose = nn.ConvTranspose2d(
+                in_channels   = ref_conv.in_channels,
+                out_channels  = ref_conv.out_channels,
+                kernel_size   = ref_conv.kernel_size,
+                stride        = ref_conv.stride,
+                padding       = ref_conv.padding,
+                output_padding= ref_conv.output_padding,
+                groups        = ref_conv.groups,
+                bias          = ref_conv.bias is not None,
+                dilation      = ref_conv.dilation,
+                padding_mode  = ref_conv.padding_mode,
+            )
+            self.conv_transpose.load_state_dict(ref_conv.state_dict())
+            bias_tensor = ref_bias
+
+        # ── branch 2 : we have raw ConvTranspose2d construction args ────────
+        else:
+            if len(args) == 0:
+                raise ValueError("Missing ConvTranspose2d args.")
+            # last positional arg must be the 1-D bias tensor
+            if not isinstance(args[-1], torch.Tensor):
+                raise ValueError(
+                    "Last positional argument must be the 1-D bias tensor "
+                    "(length = output width W)."
+                )
+            bias_tensor = args[-1]
+            conv_args   = args[:-1]
+
+            self.conv_transpose = nn.ConvTranspose2d(*conv_args, **kwargs)
+
+        # register the bias used by the fused CUDA op
+        self.register_parameter("bias",
+                                nn.Parameter(bias_tensor.clone().detach()))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.conv_transpose(x)
+        x = x.contiguous()
+        return fused_ops.fused_min_sum_gelu_bias_cuda(x, self.bias)

@@ -1,0 +1,81 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# ---------------------------------------------------------------------
+# CUDA source for fused double-Mish activation: y = mish(mish(x))
+# ---------------------------------------------------------------------
+cuda_src = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math_constants.h>
+
+__device__ __forceinline__ float mish(const float x) {
+    // Mish(x) = x * tanh(ln(1 + exp(x)))
+    const float sp = log1pf(expf(x));         // softplus
+    return x * tanhf(sp);
+}
+
+__global__ void fused_double_mish_kernel(const float* __restrict__ in,
+                                         float* __restrict__ out,
+                                         const int64_t numel) {
+    for (int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+         idx < numel;
+         idx += blockDim.x * gridDim.x) {
+        float val = in[idx];
+        // First Mish
+        val = mish(val);
+        // Second Mish
+        val = mish(val);
+        out[idx] = val;
+    }
+}
+
+torch::Tensor fused_double_mish_cuda(torch::Tensor x) {
+    // Ensure the tensor is contiguous and on CUDA
+    x = x.contiguous();
+    auto out = torch::empty_like(x);
+
+    const int64_t N = x.numel();
+    const int threads = 256;
+    const int blocks = (N + threads - 1) / threads;
+
+    fused_double_mish_kernel<<<blocks, threads>>>(x.data_ptr<float>(),
+                                                  out.data_ptr<float>(),
+                                                  N);
+    // Optional: synchronize for debug; comment out for production
+    // cudaDeviceSynchronize();
+    return out;
+}
+"""
+
+# C++ function declaration
+cpp_src = """
+torch::Tensor fused_double_mish_cuda(torch::Tensor x);
+"""
+
+# Compile the kernel
+fused_double_mish = load_inline(
+    name="fused_double_mish",
+    cpp_sources=cpp_src,
+    cuda_sources=cuda_src,
+    functions=["fused_double_mish_cuda"],
+    verbose=False,
+)
+
+# ---------------------------------------------------------------------
+# Optimized model using the fused CUDA kernel
+# ---------------------------------------------------------------------
+class ModelNew(nn.Module):
+    """
+    Optimized model: retains nn.Linear for matmul+bias and replaces the
+    two successive Mish activations with one fused CUDA kernel.
+    """
+    def __init__(self, in_features, out_features):
+        super(ModelNew, self).__init__()
+        self.linear = nn.Linear(in_features, out_features, bias=True)
+
+    def forward(self, x):
+        x = self.linear(x)
+        x = fused_double_mish.fused_double_mish_cuda(x)
+        return x

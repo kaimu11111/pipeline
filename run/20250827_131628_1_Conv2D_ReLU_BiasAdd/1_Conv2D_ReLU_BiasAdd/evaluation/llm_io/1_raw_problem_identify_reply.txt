@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Bias added before ReLU, order reversed",
+  "why_it_matters": "Reference does ReLU(x) + b; kernel computes ReLU(x+b). Negative inputs/biases yield different activations, causing large output errors.",
+  "minimal_fix_hint": "ReLU input first, then add bias per channel"
+}
+```

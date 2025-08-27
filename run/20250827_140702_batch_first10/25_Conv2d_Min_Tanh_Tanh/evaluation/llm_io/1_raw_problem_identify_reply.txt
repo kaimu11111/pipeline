@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Duplicate PYBIND11_MODULE causes multiple PyInit symbols",
+  "why_it_matters": "Linker error stops the extension from building, so fused CUDA op is unavailable; model falls back or fails, diverging from reference.",
+  "minimal_fix_hint": "Delete one PYBIND11_MODULE definition"
+}
+```

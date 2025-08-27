@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Missing CUDAContext include for getCurrentCUDAStream; compile fails",
+  "why_it_matters": "Extension fails to build, so model produces no output—completely diverging from PyTorch reference behavior.",
+  "minimal_fix_hint": "Add #include <ATen/cuda/CUDAContext.h> before kernel launch."
+}
+```

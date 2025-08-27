@@ -1,0 +1,43 @@
+{
+  "avg_speedup": 1.1064575724981747,
+  "accuracy": 1.0,
+  "num_tasks": 5,
+  "tasks": [
+    {
+      "task": "KernelBench/temp1/36_ConvTranspose2d_Min_Sum_GELU_Add.py",
+      "best_score": 0.9079118387092201,
+      "best_runnable": true,
+      "task_dir": "/home/wan00559/pipleline/run/20250827_144354_batch_first5/36_ConvTranspose2d_Min_Sum_GELU_Add",
+      "figure": "/home/wan00559/pipleline/run/20250827_144354_batch_first5/36_ConvTranspose2d_Min_Sum_GELU_Add/figures/36_ConvTranspose2d_Min_Sum_GELU_Add_score.png"
+    },
+    {
+      "task": "KernelBench/temp1/37_Matmul_Swish_Sum_GroupNorm.py",
+      "best_score": 1.1797787516421079,
+      "best_runnable": true,
+      "task_dir": "/home/wan00559/pipleline/run/20250827_144354_batch_first5/37_Matmul_Swish_Sum_GroupNorm",
+      "figure": "/home/wan00559/pipleline/run/20250827_144354_batch_first5/37_Matmul_Swish_Sum_GroupNorm/figures/37_Matmul_Swish_Sum_GroupNorm_score.png"
+    },
+    {
+      "task": "KernelBench/temp1/38_ConvTranspose3d_AvgPool_Clamp_Softmax_Multiply.py",
+      "best_score": 1.1933500502772674,
+      "best_runnable": true,
+      "task_dir": "/home/wan00559/pipleline/run/20250827_144354_batch_first5/38_ConvTranspose3d_AvgPool_Clamp_Softmax_Multiply",
+      "figure": "/home/wan00559/pipleline/run/20250827_144354_batch_first5/38_ConvTranspose3d_AvgPool_Clamp_Softmax_Multiply/figures/38_ConvTranspose3d_AvgPool_Clamp_Softmax_Multiply_score.png"
+    },
+    {
+      "task": "KernelBench/temp1/39_Gemm_Scale_BatchNorm.py",
+      "best_score": 0.9837386482787192,
+      "best_runnable": true,
+      "task_dir": "/home/wan00559/pipleline/run/20250827_144354_batch_first5/39_Gemm_Scale_BatchNorm",
+      "figure": "/home/wan00559/pipleline/run/20250827_144354_batch_first5/39_Gemm_Scale_BatchNorm/figures/39_Gemm_Scale_BatchNorm_score.png"
+    },
+    {
+      "task": "KernelBench/temp1/40_Matmul_Scaling_ResidualAdd.py",
+      "best_score": 1.2675085735835585,
+      "best_runnable": true,
+      "task_dir": "/home/wan00559/pipleline/run/20250827_144354_batch_first5/40_Matmul_Scaling_ResidualAdd",
+      "figure": "/home/wan00559/pipleline/run/20250827_144354_batch_first5/40_Matmul_Scaling_ResidualAdd/figures/40_Matmul_Scaling_ResidualAdd_score.png"
+    }
+  ],
+  "timestamp": "2025-08-27 14:56:07"
+}

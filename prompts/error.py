@@ -6,7 +6,7 @@ Adds GPU hardware context and architecture source for better fixes.
 """
 from __future__ import annotations
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Mapping, Any
 from string import Template
 
 # Project roots (adjust if your tree differs)
@@ -53,13 +53,31 @@ $Problem
 # ==========================================================
 """
 )
+def _escape_template(s: str) -> str:
+    return s.replace("$", "$$")
 
+def _sanitize_text(s: str) -> str:
+    return s.replace("```", "`")
+
+def _format_problem(problem: Optional[Any]) -> str:
+    if problem is None or problem == "":
+        return "No prior critical problem provided."
+    if isinstance(problem, Mapping):
+        # 优先按三字段拼成简短说明；否则 fallback 到 JSON
+        ci  = str(problem.get("critical_issue", "")).strip()
+        wim = str(problem.get("why_it_matters", "")).strip()
+        mfh = str(problem.get("minimal_fix_hint", "")).strip()
+        if ci or wim or mfh:
+            return f"critical_issue: {ci}\nwhy_it_matters: {wim}\nminimal_fix_hint: {mfh}"
+        return json.dumps(problem, ensure_ascii=False, indent=2)
+    # 其它类型一律转字符串
+    return str(problem)
 
 def build_error_prompt(
     *,
     old_code: str,
     error_log: str,
-    problem: Optional[str] = None,
+    problem: Optional[Any] = None,
     gpu_name: Optional[str] = None,
 ) -> str:
     """
@@ -103,10 +121,10 @@ def build_error_prompt(
     gpu_items = "\n".join(
         f"• {k}: {v}" for k, v in info.items() if k != "GPU Architecture"
     )
-
+    problem_text = _format_problem(problem)
     # Substitute all fields
     return COMPILE_ERROR.substitute(
         ERROR_LOG=error_log.strip(),
         OLD_CODE=old_code.strip(),
-        Problem = problem.strip(),
+        Problem=_escape_template(_sanitize_text(problem_text.strip())),
     )

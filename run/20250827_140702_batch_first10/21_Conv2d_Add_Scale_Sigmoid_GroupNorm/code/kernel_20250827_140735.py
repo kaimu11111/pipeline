@@ -1,0 +1,128 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# ---------------------------------------------------------------------
+# CUDA kernel: (x + bias) * scale followed by sigmoid activation
+# ---------------------------------------------------------------------
+cuda_source = r"""
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <cmath>
+
+template<typename scalar_t>
+__global__ void fused_bias_scale_sigmoid_kernel(
+        const scalar_t* __restrict__ x,
+        const scalar_t* __restrict__ bias,
+        const scalar_t* __restrict__ scale,
+        scalar_t* __restrict__ out,
+        int N, int C, int H, int W) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * C * H * W;
+    if (idx >= total) return;
+
+    // Derive channel index for broadcasting
+    int c = (idx / (H * W)) % C;
+
+    scalar_t val   = x[idx];
+    scalar_t b_val = bias[c];
+    scalar_t s_val = scale[c];
+
+    scalar_t t = (val + b_val) * s_val;
+    out[idx] = static_cast<scalar_t>(1) / (static_cast<scalar_t>(1) + expf(-t));
+}
+
+torch::Tensor fused_bias_scale_sigmoid_cuda(torch::Tensor x,
+                                            torch::Tensor bias,
+                                            torch::Tensor scale) {
+    TORCH_CHECK(x.is_cuda(),    "x must be a CUDA tensor");
+    TORCH_CHECK(bias.is_cuda(), "bias must be a CUDA tensor");
+    TORCH_CHECK(scale.is_cuda(),"scale must be a CUDA tensor");
+    TORCH_CHECK(x.dtype() == torch::kFloat32, "Only float32 supported");
+
+    int64_t N = x.size(0);
+    int64_t C = x.size(1);
+    int64_t H = x.size(2);
+    int64_t W = x.size(3);
+
+    TORCH_CHECK(bias.numel()  == C, "bias numel must equal C");
+    TORCH_CHECK(scale.numel() == C, "scale numel must equal C");
+
+    auto out = torch::empty_like(x);
+
+    int threads = 256;
+    int blocks  = (x.numel() + threads - 1) / threads;
+
+    fused_bias_scale_sigmoid_kernel<float>
+        <<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+            x.data_ptr<float>(),
+            bias.data_ptr<float>(),
+            scale.data_ptr<float>(),
+            out.data_ptr<float>(),
+            static_cast<int>(N),
+            static_cast<int>(C),
+            static_cast<int>(H),
+            static_cast<int>(W));
+
+    return out;
+}
+"""
+
+cpp_source = r"""
+torch::Tensor fused_bias_scale_sigmoid_cuda(torch::Tensor x,
+                                            torch::Tensor bias,
+                                            torch::Tensor scale);
+"""
+
+# Compile and load the CUDA extension
+fused_bias_scale_sigmoid = load_inline(
+    name="fused_bias_scale_sigmoid",
+    cpp_sources=cpp_source,
+    cuda_sources=cuda_source,
+    functions=["fused_bias_scale_sigmoid_cuda"],
+    verbose=False,
+)
+
+# ---------------------------------------------------------------------
+# Optimized Model
+# ---------------------------------------------------------------------
+class ModelNew(nn.Module):
+    """
+    Conv2D ➔ (bias + scale) ➔ Sigmoid (fused) ➔ GroupNorm
+    """
+    def __init__(self, in_channels, out_channels, kernel_size,
+                 num_groups, bias_shape, scale_shape):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.bias  = nn.Parameter(torch.randn(bias_shape))
+        self.scale = nn.Parameter(torch.randn(scale_shape))
+        self.group_norm = nn.GroupNorm(num_groups, out_channels)
+
+    def forward(self, x):
+        x = self.conv(x)
+        bias_flat  = self.bias.view(-1).contiguous()
+        scale_flat = self.scale.view(-1).contiguous()
+        x = fused_bias_scale_sigmoid.fused_bias_scale_sigmoid_cuda(
+                x, bias_flat, scale_flat)
+        x = self.group_norm(x)
+        return x
+
+# ---------------------------------------------------------------------
+# Helpers (same API as original)
+# ---------------------------------------------------------------------
+batch_size  = 64
+in_channels = 4
+out_channels = 16
+height = width = 128
+kernel_size = 3
+num_groups  = 8
+bias_shape  = (out_channels, 1, 1)
+scale_shape = (out_channels, 1, 1)
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width, device="cuda")]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, num_groups,
+            bias_shape, scale_shape]

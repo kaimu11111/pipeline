@@ -1,0 +1,114 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# ------------------------------------------------------------------
+# CUDA kernel + host wrapper (NO explicit PYBIND11_MODULE here!)
+# ------------------------------------------------------------------
+source = r"""
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <cmath>
+
+#define CUDA_KERNEL_LOOP(i, n) \
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < (n); \
+       i += blockDim.x * gridDim.x)
+
+/*  Channel-wise minimum followed by two tanh activations
+    Input : (N, C, H, W)
+    Output: (N, 1, H, W) */
+__global__ void min_double_tanh_kernel(const float* __restrict__ x,
+                                       float* __restrict__ out,
+                                       const int N,
+                                       const int C,
+                                       const int H,
+                                       const int W) {
+    const int HW    = H * W;
+    const int total = N * HW;               // one thread per (n, h, w)
+
+    CUDA_KERNEL_LOOP(idx, total) {
+        const int n  = idx / HW;
+        const int hw = idx % HW;
+        const int h  = hw / W;
+        const int w  = hw % W;
+
+        const int base   = ((n * C) * H + h) * W + w; // (n, 0, h, w)
+        const int stride = HW;                        // distance between channels
+
+        float vmin = x[base];
+        for (int c = 1; c < C; ++c) {
+            float v = x[base + c * stride];
+            vmin    = v < vmin ? v : vmin;
+        }
+
+        vmin = tanhf(vmin);
+        vmin = tanhf(vmin);
+
+        out[(n * H + h) * W + w] = vmin;              // (N,1,H,W) layout
+    }
+}
+
+at::Tensor min_double_tanh_cuda(at::Tensor x) {
+    TORCH_CHECK(x.is_cuda(),          "Input must reside on CUDA device");
+    TORCH_CHECK(x.scalar_type() == at::kFloat, "Only float32 supported");
+    TORCH_CHECK(x.dim() == 4,         "Input must be 4-D (N,C,H,W)");
+
+    x = x.contiguous();
+
+    const int N = x.size(0);
+    const int C = x.size(1);
+    const int H = x.size(2);
+    const int W = x.size(3);
+
+    auto out = torch::empty({N, 1, H, W}, x.options());
+
+    const int threads = 256;
+    const int blocks  = (N * H * W + threads - 1) / threads;
+
+    min_double_tanh_kernel<<<blocks, threads>>>(x.data_ptr<float>(),
+                                                out.data_ptr<float>(),
+                                                N, C, H, W);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess)
+        AT_ERROR("min_double_tanh_kernel launch failed: ",
+                 cudaGetErrorString(err));
+
+    return out;
+}
+"""
+
+# ------------------------------------------------------------------
+# Function prototype for automatic binding
+# ------------------------------------------------------------------
+cpp_src = "at::Tensor min_double_tanh_cuda(at::Tensor x);"
+
+# ------------------------------------------------------------------
+# Build & load the extension
+# ------------------------------------------------------------------
+min_double_tanh = load_inline(
+    name="min_double_tanh",
+    cpp_sources=cpp_src,
+    cuda_sources=source,
+    functions=["min_double_tanh_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_cuda_cflags=["-O3"],
+)
+
+# ------------------------------------------------------------------
+# Optimised model using the fused CUDA op
+# ------------------------------------------------------------------
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self._fused = min_double_tanh.min_double_tanh_cuda
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self._fused(x)
+        return x
+```

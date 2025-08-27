@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "PyInit_fused_act_bias defined twice (cpp and cuda translation units)",
+  "why_it_matters": "Linker reports multiple-definition, extension build fails, custom kernel cannot load so model forward crashes.",
+  "minimal_fix_hint": "Drop cpp_sources or remove PYBIND11_MODULE from one file."
+}
+```

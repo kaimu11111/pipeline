@@ -1,0 +1,146 @@
+You are a senior CUDA-extension developer.
+Your job is to **FIX** the compilation or runtime errors in the Python script
+shown below.
+
+OUTPUT RULES (STRICT) ────────────────────────────────────────────────
+1. Inside the block, follow **exactly** this order:
+   1. Imports – `torch`, `torch.nn`, `load_inline`.
+   2. `source` – triple‑quoted CUDA string(s) (kernel + host wrapper).
+   3. `cpp_src` – prototypes for *all* kernels you expose.
+   4. **One** `load_inline` call per kernel group.
+   5. `class ModelNew(nn.Module)` – mirrors original inputs/outputs but calls
+      your CUDA kernels.
+2. **Do NOT include** testing code, `if __name__ == "__main__"`, or extra prose.
+
+────────────────────────────────────────
+ERROR LOG
+────────────────────────────────────────
+/home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/utils/cpp_extension.py:2356: UserWarning: TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'].
+  warnings.warn(
+Error building extension 'scale_mul': [1/3] c++ -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=scale_mul -DTORCH_API_INCLUDE_EXTENSION_H -DPYBIND11_COMPILER_TYPE=\"_gcc\" -DPYBIND11_STDLIB=\"_libstdcpp\" -DPYBIND11_BUILD_ABI=\"_cxxabi1016\" -isystem /home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/include -isystem /home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/include/torch/csrc/api/include -isystem /home/wan00559/miniconda3/envs/maxk/include/python3.11 -D_GLIBCXX_USE_CXX11_ABI=1 -fPIC -std=c++17 -c /home/wan00559/.cache/torch_extensions/py311_cu126/scale_mul/main.cpp -o main.o 
+[2/3] /usr/bin/nvcc --generate-dependencies-with-compile --dependency-output cuda.cuda.o.d -DTORCH_EXTENSION_NAME=scale_mul -DTORCH_API_INCLUDE_EXTENSION_H -DPYBIND11_COMPILER_TYPE=\"_gcc\" -DPYBIND11_STDLIB=\"_libstdcpp\" -DPYBIND11_BUILD_ABI=\"_cxxabi1016\" -isystem /home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/include -isystem /home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/include/torch/csrc/api/include -isystem /home/wan00559/miniconda3/envs/maxk/include/python3.11 -D_GLIBCXX_USE_CXX11_ABI=1 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_75,code=compute_75 -gencode=arch=compute_75,code=sm_75 --compiler-options '-fPIC' -std=c++17 -c /home/wan00559/.cache/torch_extensions/py311_cu126/scale_mul/cuda.cu -o cuda.cuda.o 
+[3/3] c++ main.o cuda.cuda.o -shared -L/home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/lib -lc10 -lc10_cuda -ltorch_cpu -ltorch_cuda -ltorch -ltorch_python -L/usr/lib64 -lcudart -o scale_mul.so
+FAILED: scale_mul.so 
+c++ main.o cuda.cuda.o -shared -L/home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/lib -lc10 -lc10_cuda -ltorch_cpu -ltorch_cuda -ltorch -ltorch_python -L/usr/lib64 -lcudart -o scale_mul.so
+/usr/bin/ld: cuda.cuda.o: in function `PyInit_scale_mul':
+tmpxft_003cb88b_00000000-6_cuda.cudafe1.cpp:(.text+0x85e): multiple definition of `PyInit_scale_mul'; main.o:main.cpp:(.text+0x257): first defined here
+collect2: error: ld returned 1 exit status
+ninja: build stopped: subcommand failed.
+
+────────────────────────────────────────
+OLD CODE (read-only)
+────────────────────────────────────────
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# ------------------------------------------------------------------
+# Custom CUDA kernel: column-wise scaling for a 2-D tensor
+# ------------------------------------------------------------------
+cuda_src = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+template <typename scalar_t>
+__global__ void scale_mul_kernel(const scalar_t* __restrict__ x,
+                                 const scalar_t* __restrict__ scale,
+                                 scalar_t* __restrict__ out,
+                                 int rows,
+                                 int cols) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = rows * cols;
+    if (idx < total) {
+        int col = idx % cols;           // feature dimension
+        out[idx] = x[idx] * scale[col]; // element-wise multiply
+    }
+}
+
+torch::Tensor scale_mul_cuda(torch::Tensor x, torch::Tensor scale) {
+    x = x.contiguous();
+    scale = scale.contiguous();
+
+    const int rows = x.size(0);
+    const int cols = x.size(1);
+    const int total = rows * cols;
+
+    auto out = torch::empty_like(x);
+
+    const int threads = 256;
+    const int blocks = (total + threads - 1) / threads;
+
+    AT_DISPATCH_FLOATING_TYPES(x.scalar_type(), "scale_mul_cuda", ([&] {
+        scale_mul_kernel<scalar_t><<<blocks, threads>>>(
+            x.data_ptr<scalar_t>(),
+            scale.data_ptr<scalar_t>(),
+            out.data_ptr<scalar_t>(),
+            rows,
+            cols);
+    }));
+
+    return out;
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("scale_mul_cuda", &scale_mul_cuda, "Column-wise scale multiply (CUDA)");
+}
+"""
+
+cpp_decls = "torch::Tensor scale_mul_cuda(torch::Tensor x, torch::Tensor scale);"
+
+scale_mul = load_inline(
+    name="scale_mul",
+    cpp_sources=cpp_decls,
+    cuda_sources=cuda_src,
+    functions=["scale_mul_cuda"],
+    verbose=False,
+)
+
+# ------------------------------------------------------------------
+# Optimized model using the custom kernel
+# ------------------------------------------------------------------
+class ModelNew(nn.Module):
+    """
+    Optimized model:
+      1. GEMM via nn.Linear
+      2. Custom CUDA kernel for column-wise scaling
+      3. BatchNorm1d
+    """
+    def __init__(self, in_features, out_features, scale_shape, eps=1e-5, momentum=0.1):
+        super(ModelNew, self).__init__()
+        self.gemm = nn.Linear(in_features, out_features)
+        self.scale = nn.Parameter(torch.randn(scale_shape))
+        self.bn = nn.BatchNorm1d(out_features, eps=eps, momentum=momentum)
+        self.scale_mul = scale_mul
+
+    def forward(self, x):
+        x = self.gemm(x)
+        x = self.scale_mul.scale_mul_cuda(x, self.scale)
+        x = self.bn(x)
+        return x
+
+# ------------------------------------------------------------------
+# Helpers for external use
+# ------------------------------------------------------------------
+batch_size = 512
+in_features = 4096
+out_features = 4096
+scale_shape = (out_features,)
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features).cuda()]
+
+def get_init_inputs():
+    return [in_features, out_features, scale_shape]
+
+────────────────────────────────────────
+Main Critical Problem
+────────────────────────────────────────
+critical_issue: Duplicate PYBIND11_MODULE definitions cause symbol clash
+why_it_matters: main.cpp and cuda.cu both define PyInit_scale_mul, the linker errors out, extension never builds or runs.
+minimal_fix_hint: Remove module block from cuda_src.
+
+```python
+# <your corrected code>
+```
+# ==========================================================

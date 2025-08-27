@@ -1,0 +1,196 @@
+You are a senior CUDA-extension developer.
+Your job is to **FIX** the compilation or runtime errors in the Python script
+shown below.
+
+OUTPUT RULES (STRICT) ────────────────────────────────────────────────
+1. Inside the block, follow **exactly** this order:
+   1. Imports – `torch`, `torch.nn`, `load_inline`.
+   2. `source` – triple‑quoted CUDA string(s) (kernel + host wrapper).
+   3. `cpp_src` – prototypes for *all* kernels you expose.
+   4. **One** `load_inline` call per kernel group.
+   5. `class ModelNew(nn.Module)` – mirrors original inputs/outputs but calls
+      your CUDA kernels.
+2. **Do NOT include** testing code, `if __name__ == "__main__"`, or extra prose.
+
+────────────────────────────────────────
+ERROR LOG
+────────────────────────────────────────
+Traceback (most recent call last):
+  File "/home/wan00559/pipleline/utils/compile_and_run.py", line 541, in compare_and_bench
+    raise ValueError(
+ValueError: Outputs are not close (atol=0.001, rtol=0.001). max_abs_err=3.541e+00, mean_abs_err=3.119e-01
+
+────────────────────────────────────────
+OLD CODE (read-only)
+────────────────────────────────────────
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_src = r"""
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+__device__ __forceinline__ float gelu(float x) {
+    const float kAlpha = 0.7978845608028654f;      // sqrt(2/pi)
+    const float kGamma = 0.044715f;
+    return 0.5f * x * (1.0f + tanhf(kAlpha * (x + kGamma * x * x * x)));
+}
+
+__global__ void layernorm_gelu_scale_kernel(
+        const float* __restrict__ input,
+        float* __restrict__ output,
+        const int C,
+        const int D,
+        const int H,
+        const int W,
+        const int total_pos,   // N*D*H*W
+        const float eps,
+        const float scaling) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_pos) return;
+
+    /* Decompose linear index -> (n, d, h, w) */
+    int w = idx % W;
+    int t = idx / W;
+    int h = t % H;
+    t /= H;
+    int d = t % D;
+    int n = t / D;
+
+    const int DHW = D * H * W;
+    const int HW  = H * W;
+
+    /* Base offset for (n, 0, d, h, w) */
+    size_t base_offset = (((size_t)n * C) * D + d) * H * W + h * W + w;
+
+    /* ——— compute mean ——— */
+    float mean = 0.f;
+    for (int c = 0; c < C; ++c) {
+        mean += input[base_offset + (size_t)c * DHW];
+    }
+    mean /= static_cast<float>(C);
+
+    /* ——— compute variance ——— */
+    float var = 0.f;
+    for (int c = 0; c < C; ++c) {
+        float diff = input[base_offset + (size_t)c * DHW] - mean;
+        var += diff * diff;
+    }
+    var /= static_cast<float>(C);
+    float inv_std = rsqrtf(var + eps);
+
+    /* ——— normalize + GELU + scale ——— */
+    for (int c = 0; c < C; ++c) {
+        float val = input[base_offset + (size_t)c * DHW];
+        val = (val - mean) * inv_std;   // layer norm
+        val = gelu(val);                // GELU
+        val *= scaling;                 // scaling
+        output[base_offset + (size_t)c * DHW] = val;
+    }
+}
+
+torch::Tensor fused_layernorm_gelu_scale_cuda(torch::Tensor x,
+                                              float eps,
+                                              float scaling) {
+    TORCH_CHECK(x.is_cuda(), "Input must be CUDA");
+    TORCH_CHECK(x.scalar_type() == at::kFloat, "Only float32 supported");
+    x = x.contiguous();
+    auto out = torch::empty_like(x);
+
+    const int N = x.size(0);
+    const int C = x.size(1);
+    const int D = x.size(2);
+    const int H = x.size(3);
+    const int W = x.size(4);
+
+    const int total_pos = N * D * H * W;
+
+    int threads = 256;
+    int blocks  = (total_pos + threads - 1) / threads;
+
+    layernorm_gelu_scale_kernel<<<blocks, threads>>>(
+        x.data_ptr<float>(),
+        out.data_ptr<float>(),
+        C, D, H, W,
+        total_pos,
+        eps,
+        scaling);
+
+    return out;
+}
+"""
+
+cpp_src = """
+torch::Tensor fused_layernorm_gelu_scale_cuda(torch::Tensor x,
+                                              float eps,
+                                              float scaling);
+"""
+
+fused_ops = load_inline(
+    name="fused_layernorm_gelu_scale",
+    cpp_sources=cpp_src,
+    cuda_sources=cuda_src,
+    functions=["fused_layernorm_gelu_scale_cuda"],
+    verbose=False,
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model:
+    - PyTorch ConvTranspose3d
+    - Custom fused CUDA kernel for LayerNorm + GELU + scaling
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride,
+                 padding, bias=True, eps=1e-5, scaling_factor=1.0):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(
+            in_channels, out_channels, kernel_size,
+            stride=stride, padding=padding, bias=bias
+        )
+        self.eps = eps
+        self.scaling_factor = float(scaling_factor)
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        # fused LayerNorm (over channel dim), GELU, and scaling
+        x = fused_ops.fused_layernorm_gelu_scale_cuda(
+            x, self.eps, self.scaling_factor
+        )
+        return x
+
+
+# --------- helper functions (unchanged) ----------
+batch_size = 16
+in_channels = 16
+out_channels = 32
+D, H, W = 8, 16, 16
+kernel_size = 4
+stride = 2
+padding = 1
+bias = True
+eps = 1e-5
+scaling_factor = 1.0
+
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, D, H, W, device="cuda")]
+
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, stride, padding,
+            bias, eps, scaling_factor]
+
+────────────────────────────────────────
+Main Critical Problem
+────────────────────────────────────────
+critical_issue: LayerNorm over C, but PyTorch normalizes over last (W) dim
+why_it_matters: Mean/variance computed on wrong axis, so every value is rescaled differently from reference, giving large output errors.
+minimal_fix_hint: iterate over W dimension, not channels
+
+```python
+# <your corrected code>
+```
+# ==========================================================

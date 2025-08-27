@@ -1,0 +1,5 @@
+{
+  "critical_issue": "LayerNorm over C, but PyTorch normalizes over last (W) dim",
+  "why_it_matters": "Mean/variance computed on wrong axis, so every value is rescaled differently from reference, giving large output errors.",
+  "minimal_fix_hint": "iterate over W dimension, not channels"
+}

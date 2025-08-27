@@ -1,0 +1,154 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# ----------------------------------------------------------------------
+# CUDA kernel + C++ launcher
+# ----------------------------------------------------------------------
+cuda_src = r"""
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+/*
+    Fused kernel that performs:
+        1. Per-row (instance) mean/variance calculation
+        2. Normalisation:  x̂ = (x - mean) / sqrt(var + eps)
+        3. Element-wise fusion: out = (x̂ + y) * y
+*/
+__global__ void fused_norm_add_mul_kernel(
+        const float* __restrict__ x,
+        const float* __restrict__ y,
+        float* __restrict__ out,
+        const int features,
+        const float eps) {
+
+    extern __shared__ float shmem[];   // size: blockDim.x
+
+    const int row = blockIdx.x;        // one block per sample
+    const int tid = threadIdx.x;
+
+    const float* x_row   = x   + row * features;
+    const float* y_row   = y   + row * features;
+    float*       out_row = out + row * features;
+
+    // --------------------------------------------------
+    // Step-1: mean
+    // --------------------------------------------------
+    float sum = 0.f;
+    for (int idx = tid; idx < features; idx += blockDim.x)
+        sum += x_row[idx];
+
+    shmem[tid] = sum;
+    __syncthreads();
+
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride)
+            shmem[tid] += shmem[tid + stride];
+        __syncthreads();
+    }
+    const float mean = shmem[0] / static_cast<float>(features);
+
+    // --------------------------------------------------
+    // Step-2: variance
+    // --------------------------------------------------
+    float var_acc = 0.f;
+    for (int idx = tid; idx < features; idx += blockDim.x) {
+        const float diff = x_row[idx] - mean;
+        var_acc += diff * diff;
+    }
+
+    shmem[tid] = var_acc;
+    __syncthreads();
+
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride)
+            shmem[tid] += shmem[tid + stride];
+        __syncthreads();
+    }
+    const float var     = shmem[0] / static_cast<float>(features);
+    const float inv_std = rsqrtf(var + eps);
+
+    // --------------------------------------------------
+    // Step-3: normalise, add, multiply
+    // --------------------------------------------------
+    for (int idx = tid; idx < features; idx += blockDim.x) {
+        const float norm_x = (x_row[idx] - mean) * inv_std;
+        const float y_val  = y_row[idx];
+        out_row[idx] = (norm_x + y_val) * y_val;
+    }
+}
+
+torch::Tensor fused_forward_cuda(torch::Tensor x,
+                                 torch::Tensor y,
+                                 const float   eps) {
+    TORCH_CHECK(x.is_cuda(), "x must reside on CUDA device");
+    TORCH_CHECK(y.is_cuda(), "y must reside on CUDA device");
+    TORCH_CHECK(x.sizes() == y.sizes(), "x and y must have identical shapes");
+    TORCH_CHECK(x.dtype() == torch::kFloat32, "only float32 supported");
+
+    const int  batch    = x.size(0);
+    const int  features = x.size(1);
+    auto out = torch::empty_like(x);
+
+    const int threads     = 256;
+    const dim3 grid(batch);
+    const dim3 block(threads);
+    const size_t shmem_sz = threads * sizeof(float);  // for reductions
+
+    fused_norm_add_mul_kernel<<<grid, block, shmem_sz>>>(
+        x.data_ptr<float>(),
+        y.data_ptr<float>(),
+        out.data_ptr<float>(),
+        features,
+        eps);
+
+    return out;
+}
+"""
+
+cpp_src = r"""
+torch::Tensor fused_forward_cuda(torch::Tensor x,
+                                 torch::Tensor y,
+                                 float eps);
+"""
+
+fused_ext = load_inline(
+    name="fused_norm_add_mul",
+    cpp_sources=[cpp_src],
+    cuda_sources=[cuda_src],
+    functions=["fused_forward_cuda"],
+    verbose=False,
+)
+
+# ----------------------------------------------------------------------
+# Optimised model
+# ----------------------------------------------------------------------
+class ModelNew(nn.Module):
+    def __init__(self, in_features: int, out_features: int, eps: float = 1e-5):
+        super().__init__()
+        self.linear = nn.Linear(in_features, out_features, bias=True)
+        self.eps    = eps
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        x = self.linear(x)
+        # ensure contiguous tensors before passing to CUDA kernel
+        return fused_ext.fused_forward_cuda(x.contiguous(), y.contiguous(), self.eps)
+
+# ----------------------------------------------------------------------
+# Helpers for external runners
+# ----------------------------------------------------------------------
+batch_size   = 512
+in_features  = 4096
+out_features = 4096
+
+def get_inputs():
+    return [
+        torch.rand(batch_size, in_features,  device="cuda", dtype=torch.float32),
+        torch.rand(batch_size, out_features, device="cuda", dtype=torch.float32),
+    ]
+
+def get_init_inputs():
+    return [in_features, out_features]
+```

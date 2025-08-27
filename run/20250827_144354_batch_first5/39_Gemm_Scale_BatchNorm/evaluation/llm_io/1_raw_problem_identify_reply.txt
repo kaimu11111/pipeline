@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Two PyInit_scale_cuda symbols defined",
+  "why_it_matters": "load_inline auto-generates a module; the manual PYBIND11_MODULE block adds a second, so linking fails—extension never builds, model cannot execute.",
+  "minimal_fix_hint": "Delete manual PYBIND11_MODULE block."
+}
+```

@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "No backward implementation for custom op",
+  "why_it_matters": "Result comes with requires_grad=False; gradients for conv weights and bias vanish, breaking training semantics vs. reference.",
+  "minimal_fix_hint": "Wrap kernel in torch::autograd::Function with backward."
+}
+```

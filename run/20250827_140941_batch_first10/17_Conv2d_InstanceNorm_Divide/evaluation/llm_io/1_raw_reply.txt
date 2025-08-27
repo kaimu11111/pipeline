@@ -1,0 +1,177 @@
+```python
+# 1. Imports
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# 2. CUDA + host implementation
+source = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// ---------------------------------------------------------------------
+// CUDA kernel
+// ---------------------------------------------------------------------
+__global__ void instancenorm_div_kernel(const float* __restrict__ input,
+                                        float*       __restrict__ output,
+                                        const float* __restrict__ weight,
+                                        const float* __restrict__ bias,
+                                        const int C,
+                                        const int H,
+                                        const int W,
+                                        const float eps,
+                                        const float inv_div_by)
+{
+    const int HW = H * W;
+    const int nc = blockIdx.x;      // one block per (N,C)
+    const int c  = nc % C;
+
+    const float* x_ptr = input  + nc * HW;
+    float*       y_ptr = output + nc * HW;
+
+    extern __shared__ float shm[];          // size = 2 * blockDim.x floats
+    float* shm_sum   = shm;                 // partial sums
+    float* shm_sqsum = shm + blockDim.x;    // partial squared sums
+
+    // -----------------------------------------------------------------
+    // 1) compute mean & variance for this (n,c) pair
+    // -----------------------------------------------------------------
+    float sum   = 0.0f;
+    float sqsum = 0.0f;
+
+    for (int idx = threadIdx.x; idx < HW; idx += blockDim.x) {
+        float v = x_ptr[idx];
+        sum   += v;
+        sqsum += v * v;
+    }
+
+    shm_sum[threadIdx.x]   = sum;
+    shm_sqsum[threadIdx.x] = sqsum;
+    __syncthreads();
+
+    // block-level reduction
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            shm_sum[threadIdx.x]   += shm_sum[threadIdx.x + stride];
+            shm_sqsum[threadIdx.x] += shm_sqsum[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+
+    const float mean    = shm_sum[0] / HW;
+    const float var     = shm_sqsum[0] / HW - mean * mean;
+    const float inv_std = rsqrtf(var + eps);
+
+    // affine + divide-by
+    const float gamma = (weight ? weight[c] : 1.0f) * inv_div_by;
+    const float beta  = (bias  ? bias[c]   : 0.0f) * inv_div_by;
+
+    // -----------------------------------------------------------------
+    // 2) normalise, affine, divide
+    // -----------------------------------------------------------------
+    for (int idx = threadIdx.x; idx < HW; idx += blockDim.x) {
+        float y = (x_ptr[idx] - mean) * inv_std;  // InstanceNorm
+        y = y * gamma + beta;                     // affine + divide
+        y_ptr[idx] = y;
+    }
+}
+
+// ---------------------------------------------------------------------
+// Host launcher
+// ---------------------------------------------------------------------
+torch::Tensor instancenorm_div_cuda(torch::Tensor input,
+                                    c10::optional<torch::Tensor> weight_opt,
+                                    c10::optional<torch::Tensor> bias_opt,
+                                    const float eps,
+                                    const float divide_by)
+{
+    TORCH_CHECK(input.is_cuda(), "input must live on CUDA");
+    TORCH_CHECK(input.scalar_type() == torch::kFloat,
+                "only float32 is supported");
+    TORCH_CHECK(input.dim() == 4, "expect NCHW tensor");
+
+    const int N = input.size(0);
+    const int C = input.size(1);
+    const int H = input.size(2);
+    const int W = input.size(3);
+
+    auto output = torch::empty_like(input);
+
+    const int blocks   = N * C;     // one block per (n,c)
+    const int threads  = 256;
+    const size_t shm   = threads * 2 * sizeof(float);
+    const float inv_db = 1.0f / divide_by;
+
+    const float* w_ptr = weight_opt.has_value()
+                         ? weight_opt.value().data_ptr<float>()
+                         : nullptr;
+    const float* b_ptr = bias_opt.has_value()
+                         ? bias_opt.value().data_ptr<float>()
+                         : nullptr;
+
+    instancenorm_div_kernel<<<blocks, threads, shm>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        w_ptr,
+        b_ptr,
+        C, H, W,
+        eps,
+        inv_db);
+
+    cudaError_t err = cudaGetLastError();
+    TORCH_CHECK(err == cudaSuccess, "kernel launch failed: ",
+                cudaGetErrorString(err));
+
+    return output;
+}
+"""
+
+# 3. C++ prototypes
+cpp_src = r"""
+torch::Tensor instancenorm_div_cuda(torch::Tensor input,
+                                    c10::optional<torch::Tensor> weight,
+                                    c10::optional<torch::Tensor> bias,
+                                    float eps,
+                                    float divide_by);
+"""
+
+# 4. Build / load extension
+fused = load_inline(
+    name="fused_instancenorm_div",
+    cpp_sources=cpp_src,
+    cuda_sources=source,
+    functions=["instancenorm_div_cuda"],
+    verbose=False,
+)
+
+# ---------------------------------------------------------------------
+# Python wrappers
+# ---------------------------------------------------------------------
+class FusedInstanceNormDiv(nn.Module):
+    def __init__(self, num_features, eps=1e-5, divide_by=1.0):
+        super().__init__()
+        self.eps = float(eps)
+        self.divide_by = float(divide_by)
+
+        self.weight = nn.Parameter(torch.ones(num_features, device="cuda"))
+        self.bias   = nn.Parameter(torch.zeros(num_features, device="cuda"))
+
+    def forward(self, x):
+        return fused.instancenorm_div_cuda(
+            x, self.weight, self.bias, self.eps, self.divide_by
+        )
+
+# 5. Optimised model
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, divide_by):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size).cuda()
+        self.inst_div = FusedInstanceNormDiv(out_channels,
+                                             eps=1e-5,
+                                             divide_by=divide_by)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.inst_div(x)
+        return x
+```

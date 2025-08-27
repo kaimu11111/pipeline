@@ -1,0 +1,172 @@
+You are a senior CUDA-extension developer.
+Your job is to **FIX** the compilation or runtime errors in the Python script
+shown below.
+
+OUTPUT RULES (STRICT) ────────────────────────────────────────────────
+1. Inside the block, follow **exactly** this order:
+   1. Imports – `torch`, `torch.nn`, `load_inline`.
+   2. `source` – triple‑quoted CUDA string(s) (kernel + host wrapper).
+   3. `cpp_src` – prototypes for *all* kernels you expose.
+   4. **One** `load_inline` call per kernel group.
+   5. `class ModelNew(nn.Module)` – mirrors original inputs/outputs but calls
+      your CUDA kernels.
+2. **Do NOT include** testing code, `if __name__ == "__main__"`, or extra prose.
+
+────────────────────────────────────────
+ERROR LOG
+────────────────────────────────────────
+/home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/utils/cpp_extension.py:2356: UserWarning: TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'].
+  warnings.warn(
+Error building extension 'fused_bias_scale_sigmoid': [1/2] /usr/bin/nvcc --generate-dependencies-with-compile --dependency-output cuda.cuda.o.d -DTORCH_EXTENSION_NAME=fused_bias_scale_sigmoid -DTORCH_API_INCLUDE_EXTENSION_H -DPYBIND11_COMPILER_TYPE=\"_gcc\" -DPYBIND11_STDLIB=\"_libstdcpp\" -DPYBIND11_BUILD_ABI=\"_cxxabi1016\" -isystem /home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/include -isystem /home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/include/torch/csrc/api/include -isystem /home/wan00559/miniconda3/envs/maxk/include/python3.11 -D_GLIBCXX_USE_CXX11_ABI=1 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_75,code=compute_75 -gencode=arch=compute_75,code=sm_75 --compiler-options '-fPIC' -std=c++17 -c /home/wan00559/.cache/torch_extensions/py311_cu126/fused_bias_scale_sigmoid/cuda.cu -o cuda.cuda.o 
+[2/2] c++ main.o cuda.cuda.o -shared -L/home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/lib -lc10 -lc10_cuda -ltorch_cpu -ltorch_cuda -ltorch -ltorch_python -L/usr/lib64 -lcudart -o fused_bias_scale_sigmoid.so
+FAILED: fused_bias_scale_sigmoid.so 
+c++ main.o cuda.cuda.o -shared -L/home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/lib -lc10 -lc10_cuda -ltorch_cpu -ltorch_cuda -ltorch -ltorch_python -L/usr/lib64 -lcudart -o fused_bias_scale_sigmoid.so
+/usr/bin/ld: cuda.cuda.o: in function `PyInit_fused_bias_scale_sigmoid':
+tmpxft_003cae3a_00000000-6_cuda.cudafe1.cpp:(.text+0x6f8): multiple definition of `PyInit_fused_bias_scale_sigmoid'; main.o:main.cpp:(.text+0x257): first defined here
+collect2: error: ld returned 1 exit status
+ninja: build stopped: subcommand failed.
+
+────────────────────────────────────────
+OLD CODE (read-only)
+────────────────────────────────────────
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# ---------------------------------------------------------------------
+# CUDA kernel + host wrapper
+# ---------------------------------------------------------------------
+source = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>   // <-- gives getCurrentCUDAStream
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+template <typename scalar_t>
+__global__ void fused_bias_scale_sigmoid_kernel(
+        const scalar_t* __restrict__ x,
+        const scalar_t* __restrict__ bias,
+        const scalar_t* __restrict__ scale,
+        scalar_t* __restrict__ out,
+        int elements,
+        int C,
+        int HW)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= elements) return;
+
+    /* idx layout:  N*C*H*W  with   HW = H*W  */
+    int c = (idx / HW) % C;
+
+    scalar_t val   = x[idx];
+    scalar_t b_val = bias[c];
+    scalar_t s_val = scale[c];
+
+    scalar_t t = (val + b_val) * s_val;
+    out[idx] = static_cast<scalar_t>(1) /
+               (static_cast<scalar_t>(1) + expf(-t));
+}
+
+/* ------------------------------------------------------------------ */
+/* Host-facing wrapper                                                 */
+/* ------------------------------------------------------------------ */
+torch::Tensor fused_bias_scale_sigmoid_cuda(torch::Tensor x,
+                                            torch::Tensor bias,
+                                            torch::Tensor scale)
+{
+    TORCH_CHECK(x.is_cuda(),    "x must be CUDA");
+    TORCH_CHECK(bias.is_cuda(), "bias must be CUDA");
+    TORCH_CHECK(scale.is_cuda(),"scale must be CUDA");
+    TORCH_CHECK(x.dtype() == torch::kFloat32, "only float32 supported");
+
+    const int64_t N  = x.size(0);
+    const int64_t C  = x.size(1);
+    const int64_t H  = x.size(2);
+    const int64_t W  = x.size(3);
+    const int64_t HW = H * W;
+    const int64_t elements = x.numel();
+
+    TORCH_CHECK(bias.numel()  == C, "bias numel must equal channels");
+    TORCH_CHECK(scale.numel() == C, "scale numel must equal channels");
+
+    auto out = torch::empty_like(x);
+
+    const int threads = 256;
+    const int blocks  = (elements + threads - 1) / threads;
+
+    fused_bias_scale_sigmoid_kernel<float>
+        <<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+            x.data_ptr<float>(),
+            bias.data_ptr<float>(),
+            scale.data_ptr<float>(),
+            out.data_ptr<float>(),
+            static_cast<int>(elements),
+            static_cast<int>(C),
+            static_cast<int>(HW));
+
+    return out;
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("fused_bias_scale_sigmoid_cuda",
+          &fused_bias_scale_sigmoid_cuda,
+          "Fused (bias + scale) + sigmoid (CUDA)");
+}
+"""
+
+# ---------------------------------------------------------------------
+# C++ prototypes
+# ---------------------------------------------------------------------
+cpp_src = r"""
+torch::Tensor fused_bias_scale_sigmoid_cuda(torch::Tensor x,
+                                            torch::Tensor bias,
+                                            torch::Tensor scale);
+"""
+
+# ---------------------------------------------------------------------
+# Build & load
+# ---------------------------------------------------------------------
+fused_bias_scale_sigmoid = load_inline(
+    name="fused_bias_scale_sigmoid",
+    cpp_sources=cpp_src,
+    cuda_sources=source,
+    functions=["fused_bias_scale_sigmoid_cuda"],
+    verbose=False,
+)
+
+# ---------------------------------------------------------------------
+# Optimised model wrapper
+# ---------------------------------------------------------------------
+class ModelNew(nn.Module):
+    """
+    Conv2D ➔ fused (bias + scale + sigmoid) ➔ GroupNorm
+    """
+    def __init__(self, in_channels, out_channels, kernel_size,
+                 num_groups, bias_shape, scale_shape):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, padding=kernel_size//2)
+        self.bias  = nn.Parameter(torch.randn(bias_shape))
+        self.scale = nn.Parameter(torch.randn(scale_shape))
+        self.group_norm = nn.GroupNorm(num_groups, out_channels)
+
+    def forward(self, x):
+        x = self.conv(x)
+        # Flatten for channel-wise tensors
+        bias_flat  = self.bias.view(-1).contiguous()
+        scale_flat = self.scale.view(-1).contiguous()
+        x = fused_bias_scale_sigmoid.fused_bias_scale_sigmoid_cuda(x, bias_flat, scale_flat)
+        x = self.group_norm(x)
+        return x
+
+────────────────────────────────────────
+Main Critical Problem
+────────────────────────────────────────
+critical_issue: Conv layer adds padding=kernel_size//2
+why_it_matters: Reference uses zero padding, candidate keeps spatial size, altering every downstream value and output tensor shape.
+minimal_fix_hint: Remove padding parameter in ModelNew.conv
+
+```python
+# <your corrected code>
+```
+# ==========================================================

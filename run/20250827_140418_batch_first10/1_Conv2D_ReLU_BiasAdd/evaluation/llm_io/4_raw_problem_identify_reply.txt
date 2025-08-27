@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Conv2d instantiated with bias=False",
+  "why_it_matters": "Reference model includes convolution bias; omitting it shifts all activations, producing large output and gradient discrepancies.",
+  "minimal_fix_hint": "set nn.Conv2d(..., bias=True)"
+}
+```

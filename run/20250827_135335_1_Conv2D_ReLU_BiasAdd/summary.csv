@@ -1,0 +1,5 @@
+task,best_score,best_runnable,task_dir,figure
+KernelBench/level2test/1_Conv2D_ReLU_BiasAdd.py,1.072327,1,/home/wan00559/pipleline/run/20250827_135335_1_Conv2D_ReLU_BiasAdd/1_Conv2D_ReLU_BiasAdd,/home/wan00559/pipleline/run/20250827_135335_1_Conv2D_ReLU_BiasAdd/1_Conv2D_ReLU_BiasAdd/figures/1_Conv2D_ReLU_BiasAdd_score.png
+
+avg_speedup,1.072327
+accuracy,1.000000

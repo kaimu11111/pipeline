@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "ModelNew expects bias tensor, but reference supplies shape tuple",
+  "why_it_matters": "During tests ModelNew(*init_args) receives (1,1,1) tuple, triggers ValueError, so model cannot even compile or run.",
+  "minimal_fix_hint": "Handle bias_shape tuple by creating Parameter"
+}
+```

@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "base_offset omits factor C for batch n>0",
+  "why_it_matters": "For n>0 each thread reads/writes data C·DHW elements earlier, mixing samples and yielding wrong soft-max values.",
+  "minimal_fix_hint": "add n*C*DHW when computing base_offset"
+}
+```

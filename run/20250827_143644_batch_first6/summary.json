@@ -1,0 +1,50 @@
+{
+  "avg_speedup": 1.0453814180937686,
+  "accuracy": 1.0,
+  "num_tasks": 6,
+  "tasks": [
+    {
+      "task": "KernelBench/temp/4_Conv2d_Mish_Mish.py",
+      "best_score": 1.066650888018005,
+      "best_runnable": true,
+      "task_dir": "/home/wan00559/pipleline/run/20250827_143644_batch_first6/4_Conv2d_Mish_Mish",
+      "figure": "/home/wan00559/pipleline/run/20250827_143644_batch_first6/4_Conv2d_Mish_Mish/figures/4_Conv2d_Mish_Mish_score.png"
+    },
+    {
+      "task": "KernelBench/temp/5_ConvTranspose2d_Subtract_Tanh.py",
+      "best_score": 0.8434836846047593,
+      "best_runnable": true,
+      "task_dir": "/home/wan00559/pipleline/run/20250827_143644_batch_first6/5_ConvTranspose2d_Subtract_Tanh",
+      "figure": "/home/wan00559/pipleline/run/20250827_143644_batch_first6/5_ConvTranspose2d_Subtract_Tanh/figures/5_ConvTranspose2d_Subtract_Tanh_score.png"
+    },
+    {
+      "task": "KernelBench/temp/6_Conv3d_Softmax_MaxPool_MaxPool.py",
+      "best_score": 0.9815233706563011,
+      "best_runnable": true,
+      "task_dir": "/home/wan00559/pipleline/run/20250827_143644_batch_first6/6_Conv3d_Softmax_MaxPool_MaxPool",
+      "figure": "/home/wan00559/pipleline/run/20250827_143644_batch_first6/6_Conv3d_Softmax_MaxPool_MaxPool/figures/6_Conv3d_Softmax_MaxPool_MaxPool_score.png"
+    },
+    {
+      "task": "KernelBench/temp/7_Conv3d_ReLU_LeakyReLU_GELU_Sigmoid_BiasAdd.py",
+      "best_score": 1.3828320263240212,
+      "best_runnable": true,
+      "task_dir": "/home/wan00559/pipleline/run/20250827_143644_batch_first6/7_Conv3d_ReLU_LeakyReLU_GELU_Sigmoid_BiasAdd",
+      "figure": "/home/wan00559/pipleline/run/20250827_143644_batch_first6/7_Conv3d_ReLU_LeakyReLU_GELU_Sigmoid_BiasAdd/figures/7_Conv3d_ReLU_LeakyReLU_GELU_Sigmoid_BiasAdd_score.png"
+    },
+    {
+      "task": "KernelBench/temp/8_Conv3d_Divide_Max_GlobalAvgPool_BiasAdd_Sum.py",
+      "best_score": 0.9727635692631441,
+      "best_runnable": true,
+      "task_dir": "/home/wan00559/pipleline/run/20250827_143644_batch_first6/8_Conv3d_Divide_Max_GlobalAvgPool_BiasAdd_Sum",
+      "figure": "/home/wan00559/pipleline/run/20250827_143644_batch_first6/8_Conv3d_Divide_Max_GlobalAvgPool_BiasAdd_Sum/figures/8_Conv3d_Divide_Max_GlobalAvgPool_BiasAdd_Sum_score.png"
+    },
+    {
+      "task": "KernelBench/temp/9_Matmul_Subtract_Multiply_ReLU.py",
+      "best_score": 1.0250349696963812,
+      "best_runnable": true,
+      "task_dir": "/home/wan00559/pipleline/run/20250827_143644_batch_first6/9_Matmul_Subtract_Multiply_ReLU",
+      "figure": "/home/wan00559/pipleline/run/20250827_143644_batch_first6/9_Matmul_Subtract_Multiply_ReLU/figures/9_Matmul_Subtract_Multiply_ReLU_score.png"
+    }
+  ],
+  "timestamp": "2025-08-27 14:51:11"
+}

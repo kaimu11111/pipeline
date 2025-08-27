@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Manual PYBIND11_MODULE duplicates loader-generated one",
+  "why_it_matters": "Linker sees two PyInit_fused_ops symbols, compilation fails, model cannot run so outputs never match PyTorch.",
+  "minimal_fix_hint": "Delete PYBIND11_MODULE block from cuda_src"
+}
+```

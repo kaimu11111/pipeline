@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "bias_shape tuple passed as groups param",
+  "why_it_matters": "ModelNew mis-parses args; ConvTranspose2d gets groups=(1,1,1), triggers TypeError, model never runs.",
+  "minimal_fix_hint": "remove/pop bias_shape tuple before conv init"
+}
+```

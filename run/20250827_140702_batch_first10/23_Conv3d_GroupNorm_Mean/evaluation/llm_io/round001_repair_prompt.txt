@@ -1,0 +1,161 @@
+You are a senior CUDA-extension developer.
+Your job is to **FIX** the compilation or runtime errors in the Python script
+shown below.
+
+OUTPUT RULES (STRICT) ────────────────────────────────────────────────
+1. Inside the block, follow **exactly** this order:
+   1. Imports – `torch`, `torch.nn`, `load_inline`.
+   2. `source` – triple‑quoted CUDA string(s) (kernel + host wrapper).
+   3. `cpp_src` – prototypes for *all* kernels you expose.
+   4. **One** `load_inline` call per kernel group.
+   5. `class ModelNew(nn.Module)` – mirrors original inputs/outputs but calls
+      your CUDA kernels.
+2. **Do NOT include** testing code, `if __name__ == "__main__"`, or extra prose.
+
+────────────────────────────────────────
+ERROR LOG
+────────────────────────────────────────
+/home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/utils/cpp_extension.py:2356: UserWarning: TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'].
+  warnings.warn(
+Error building extension 'batch_mean_ext': [1/3] c++ -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=batch_mean_ext -DTORCH_API_INCLUDE_EXTENSION_H -DPYBIND11_COMPILER_TYPE=\"_gcc\" -DPYBIND11_STDLIB=\"_libstdcpp\" -DPYBIND11_BUILD_ABI=\"_cxxabi1016\" -isystem /home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/include -isystem /home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/include/torch/csrc/api/include -isystem /home/wan00559/miniconda3/envs/maxk/include/python3.11 -D_GLIBCXX_USE_CXX11_ABI=1 -fPIC -std=c++17 -c /home/wan00559/.cache/torch_extensions/py311_cu126/batch_mean_ext/main.cpp -o main.o 
+[2/3] /usr/bin/nvcc --generate-dependencies-with-compile --dependency-output cuda.cuda.o.d -DTORCH_EXTENSION_NAME=batch_mean_ext -DTORCH_API_INCLUDE_EXTENSION_H -DPYBIND11_COMPILER_TYPE=\"_gcc\" -DPYBIND11_STDLIB=\"_libstdcpp\" -DPYBIND11_BUILD_ABI=\"_cxxabi1016\" -isystem /home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/include -isystem /home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/include/torch/csrc/api/include -isystem /home/wan00559/miniconda3/envs/maxk/include/python3.11 -D_GLIBCXX_USE_CXX11_ABI=1 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_75,code=compute_75 -gencode=arch=compute_75,code=sm_75 --compiler-options '-fPIC' -std=c++17 -c /home/wan00559/.cache/torch_extensions/py311_cu126/batch_mean_ext/cuda.cu -o cuda.cuda.o 
+[3/3] c++ main.o cuda.cuda.o -shared -L/home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/lib -lc10 -lc10_cuda -ltorch_cpu -ltorch_cuda -ltorch -ltorch_python -L/usr/lib64 -lcudart -o batch_mean_ext.so
+FAILED: batch_mean_ext.so 
+c++ main.o cuda.cuda.o -shared -L/home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/lib -lc10 -lc10_cuda -ltorch_cpu -ltorch_cuda -ltorch -ltorch_python -L/usr/lib64 -lcudart -o batch_mean_ext.so
+/usr/bin/ld: cuda.cuda.o: in function `PyInit_batch_mean_ext':
+tmpxft_003cb99f_00000000-6_cuda.cudafe1.cpp:(.text+0x4d2): multiple definition of `PyInit_batch_mean_ext'; main.o:main.cpp:(.text+0x257): first defined here
+collect2: error: ld returned 1 exit status
+ninja: build stopped: subcommand failed.
+
+────────────────────────────────────────
+OLD CODE (read-only)
+────────────────────────────────────────
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# ---------------------------------------------------------------------------
+# Inline CUDA kernel: compute per-sample mean over all dimensions except batch
+# ---------------------------------------------------------------------------
+cuda_src = r"""
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+// Kernel: one block per sample (batch element), thread-level strided reduction
+__global__ void batch_mean_kernel(const float* __restrict__ x,
+                                  float* __restrict__ out,
+                                  const int inner_size)
+{
+    const int n = blockIdx.x;                          // sample index
+    float thread_sum = 0.0f;
+
+    // Strided reduction over this sample's elements
+    for (int idx = threadIdx.x; idx < inner_size; idx += blockDim.x) {
+        thread_sum += x[n * inner_size + idx];
+    }
+
+    // Block-level reduction (assumes blockDim.x <= 1024)
+    extern __shared__ float shared[];
+    shared[threadIdx.x] = thread_sum;
+    __syncthreads();
+
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride)
+            shared[threadIdx.x] += shared[threadIdx.x + stride];
+        __syncthreads();
+    }
+
+    // Write result (normalised by number of elements)
+    if (threadIdx.x == 0)
+        out[n] = shared[0] / static_cast<float>(inner_size);
+}
+
+// C++/CUDA interface --------------------------------------------------------
+torch::Tensor batch_mean_cuda(torch::Tensor x) {
+    TORCH_CHECK(x.is_cuda(), "Input must reside on CUDA");
+    TORCH_CHECK(x.scalar_type() == torch::kFloat32,
+                "Only fp32 tensors are supported");
+
+    const int64_t N = x.size(0);
+    const int64_t inner_size = x.numel() / N;
+
+    auto out = torch::empty({N}, x.options().dtype(torch::kFloat32));
+
+    const int threads = 256;
+    const dim3 blocks(N);
+    const size_t shared_bytes = threads * sizeof(float);
+
+    batch_mean_kernel<<<blocks, threads, shared_bytes>>>(
+        x.data_ptr<float>(),
+        out.data_ptr<float>(),
+        static_cast<int>(inner_size));
+
+    return out;
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("batch_mean_cuda", &batch_mean_cuda,
+          "Per-sample mean over all dims except batch (CUDA)");
+}
+"""
+
+cpp_decl = "torch::Tensor batch_mean_cuda(torch::Tensor x);"
+
+# Build the extension
+batch_mean_ext = load_inline(
+    name="batch_mean_ext",
+    cpp_sources=cpp_decl,
+    cuda_sources=cuda_src,
+    functions=["batch_mean_cuda"],
+    verbose=False,
+)
+
+# ---------------------------------------------------------------------------
+# Optimised model that uses the custom CUDA kernel
+# ---------------------------------------------------------------------------
+class ModelNew(nn.Module):
+    """
+    Model that performs a 3D convolution, applies Group Normalization,
+    then computes the mean with a custom CUDA kernel.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, num_groups):
+        super().__init__()
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size)
+        self.group_norm = nn.GroupNorm(num_groups, out_channels)
+        self.batch_mean = batch_mean_ext
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.group_norm(x)
+        x = self.batch_mean.batch_mean_cuda(x)
+        return x
+
+# ---------------------------------------------------------------------------
+# Helper functions to match original API
+# ---------------------------------------------------------------------------
+def get_inputs():
+    batch_size = 64
+    in_channels = 3
+    D, H, W = 12, 16, 16
+    return [torch.rand(batch_size, in_channels, D, H, W, device="cuda")]
+
+def get_init_inputs():
+    in_channels = 3
+    out_channels = 24
+    kernel_size = 3
+    num_groups = 8
+    return [in_channels, out_channels, kernel_size, num_groups]
+
+────────────────────────────────────────
+Main Critical Problem
+────────────────────────────────────────
+critical_issue: CUDA input but model layers still on CPU
+why_it_matters: Passing a GPU tensor into CPU-resident Conv3d/GroupNorm triggers a device mismatch error, so forward() fails completely.
+minimal_fix_hint: Move model to .cuda() or keep inputs on CPU
+
+```python
+# <your corrected code>
+```
+# ==========================================================

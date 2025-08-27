@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "__init__ signature missing bias_shape parameter",
+  "why_it_matters": "Constructor mismatch raises TypeError at model creation; code never runs, so outputs cannot match reference.",
+  "minimal_fix_hint": "Add bias_shape arg to __init__"
+}
+```

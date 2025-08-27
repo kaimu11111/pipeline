@@ -1,0 +1,175 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# --------------------------- CUDA kernels ---------------------------------- #
+cuda_source = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+////////////////////////////////////////////////////////////////////////////////
+// HardSwish (forward only – derivative computed in Python)
+////////////////////////////////////////////////////////////////////////////////
+__global__ void hardswish_kernel(const float* __restrict__ in,
+                                 float* __restrict__ out,
+                                 int64_t size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+
+    float x = in[idx];
+    float relu6 = fminf(fmaxf(x + 3.0f, 0.0f), 6.0f);
+    out[idx] = x * relu6 * (1.0f / 6.0f);
+}
+
+torch::Tensor hardswish_cuda(torch::Tensor x) {
+    TORCH_CHECK(x.is_cuda(), "input must be a CUDA tensor");
+    TORCH_CHECK(x.scalar_type() == at::kFloat, "only float32 is supported");
+
+    auto in  = x.contiguous();
+    auto out = torch::empty_like(in);
+
+    const int64_t size    = in.numel();
+    const int      threads = 256;
+    const int      blocks  = (size + threads - 1) / threads;
+
+    hardswish_kernel<<<blocks, threads>>>(in.data_ptr<float>(),
+                                          out.data_ptr<float>(),
+                                          size);
+    return out;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Mean-pool over spatial dims (D, H, W) – forward only
+////////////////////////////////////////////////////////////////////////////////
+__global__ void mean_pool_spatial_kernel(const float* __restrict__ in,
+                                         float* __restrict__ out,
+                                         int   S) {                     // S = D*H*W
+    extern __shared__ float sdata[];
+    int bc  = blockIdx.x;           // each block handles one (B,C) pair
+    int tid = threadIdx.x;
+
+    const float* ptr = in + (size_t)bc * S;   // base pointer for this (B,C)
+
+    float sum = 0.f;
+    for (int i = tid; i < S; i += blockDim.x)
+        sum += ptr[i];
+
+    sdata[tid] = sum;
+    __syncthreads();
+
+    // block-level reduction
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride)
+            sdata[tid] += sdata[tid + stride];
+        __syncthreads();
+    }
+
+    if (tid == 0)
+        out[bc] = sdata[0] / static_cast<float>(S);
+}
+
+torch::Tensor mean_pool_spatial_cuda(torch::Tensor x) {
+    TORCH_CHECK(x.dim() == 5, "input must be 5-D (B,C,D,H,W)");
+    TORCH_CHECK(x.is_cuda(), "input must be a CUDA tensor");
+    TORCH_CHECK(x.scalar_type() == at::kFloat, "only float32 is supported");
+
+    auto in = x.contiguous();
+
+    const int64_t B = in.size(0);
+    const int64_t C = in.size(1);
+    const int64_t D = in.size(2);
+    const int64_t H = in.size(3);
+    const int64_t W = in.size(4);
+    const int      S = D * H * W;
+
+    auto out = torch::empty({B, C}, in.options());
+
+    const int threads = 256;
+    const int blocks  = B * C;
+    const int shmem   = threads * sizeof(float);
+
+    mean_pool_spatial_kernel<<<blocks, threads, shmem>>>(in.data_ptr<float>(),
+                                                         out.data_ptr<float>(),
+                                                         S);
+    return out;
+}
+"""
+
+cpp_decls = r"""
+torch::Tensor hardswish_cuda(torch::Tensor x);
+torch::Tensor mean_pool_spatial_cuda(torch::Tensor x);
+"""
+
+kernels = load_inline(name="custom_kernels",
+                      cpp_sources=cpp_decls,
+                      cuda_sources=cuda_source,
+                      functions=["hardswish_cuda",
+                                 "mean_pool_spatial_cuda"],
+                      verbose=False)
+
+# ---------------------- Python autograd wrappers --------------------------- #
+class _HardSwishFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        ctx.save_for_backward(x)
+        return kernels.hardswish_cuda(x)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        (x,) = ctx.saved_tensors
+        # derivative:
+        #   f(x)=x*clip(x+3,0,6)/6
+        #   f'(x)=0              if x<=-3
+        #          1             if x>=3
+        #          (2x+3)/6      else
+        mask_pos = (x >= 3)
+        mask_neg = (x <= -3)
+        mid      = (~mask_pos) & (~mask_neg)
+        grad_in  = torch.zeros_like(x)
+
+        grad_in[mask_pos] = grad_out[mask_pos]
+        grad_in[mid]      = grad_out[mid] * ((2 * x[mid] + 3) / 6.0)
+
+        return grad_in
+
+def hardswish(x):
+    return _HardSwishFn.apply(x)
+
+
+class _MeanPoolSpatialFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        ctx.shape = x.shape
+        return kernels.mean_pool_spatial_cuda(x)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        B, C, D, H, W = ctx.shape
+        S = D * H * W
+        grad = grad_out.view(B, C, 1, 1, 1).expand(B, C, D, H, W) / S
+        return grad
+
+def mean_pool_spatial(x):
+    return _MeanPoolSpatialFn.apply(x)
+
+# ------------------------------- Model ------------------------------------- #
+class ModelNew(nn.Module):
+    """
+    Optimised version of the original model using custom CUDA kernels
+    for HardSwish activation and spatial mean pooling.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size,
+                 num_groups=4, bias=True):
+        super().__init__()
+        self.conv        = nn.Conv3d(in_channels, out_channels,
+                                     kernel_size, bias=bias)
+        self.group_norm  = nn.GroupNorm(num_groups, out_channels)
+
+    def forward(self, x):
+        x = self.conv(x)                  # (B, C, D, H, W)
+        x = hardswish(x)                  # custom CUDA HardSwish
+        x = self.group_norm(x)            # GroupNorm
+        x = mean_pool_spatial(x)          # custom CUDA mean pool -> (B, C)
+        return x
+```

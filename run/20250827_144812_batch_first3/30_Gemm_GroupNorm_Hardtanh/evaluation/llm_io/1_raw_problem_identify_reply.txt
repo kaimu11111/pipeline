@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "PyInit_hardtanh_ext defined in both sources → link-time multiple definition",
+  "why_it_matters": "Extension fails to build, custom kernel unavailable; model errors or reverts to CPU clamp, diverging from reference.",
+  "minimal_fix_hint": "Delete extra module definition or omit cpp_sources string"
+}
+```

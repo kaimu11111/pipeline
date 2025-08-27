@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Kernel adds bias before ReLU, reference adds after",
+  "why_it_matters": "Reversing order changes values whenever bias shifts negative conv outputs above zero, producing large output errors",
+  "minimal_fix_hint": "Apply ReLU to x first, then add bias"
+}
+```

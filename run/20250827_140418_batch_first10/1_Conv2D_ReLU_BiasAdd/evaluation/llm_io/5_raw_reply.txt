@@ -1,0 +1,172 @@
+```python
+# 1 ─────────────────────────────────── Imports
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# 2 ─────────────────────────────────── CUDA / C++ source
+source = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+//////////////////////////////////////////////////////////////////
+//                        Forward kernel                        //
+//////////////////////////////////////////////////////////////////
+__global__ void relu_bias_add_fwd_kernel(const float* __restrict__ in,
+                                         const float* __restrict__ bias,
+                                         float* __restrict__ out,
+                                         const int channels,
+                                         const int hw,
+                                         const int total) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    const int c  = (idx / hw) % channels;
+    float v = in[idx];
+    v = v > 0.f ? v : 0.f;          // ReLU
+    out[idx] = v + bias[c];         // bias add (after ReLU)
+}
+
+//////////////////////////////////////////////////////////////////
+//                        Backward kernel                       //
+//////////////////////////////////////////////////////////////////
+__global__ void relu_bias_add_bwd_kernel(const float* __restrict__ grad_out,
+                                         const float* __restrict__ input,
+                                         float* __restrict__ grad_in,
+                                         float* __restrict__ grad_bias,
+                                         const int channels,
+                                         const int hw,
+                                         const int total) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    const int c  = (idx / hw) % channels;
+
+    const float go = grad_out[idx];
+    const float gi = (input[idx] > 0.f ? 1.f : 0.f) * go;
+
+    grad_in[idx] = gi;
+    atomicAdd(&grad_bias[c], go);
+}
+
+//////////////////////////////////////////////////////////////////
+//                    Host-side CUDA wrappers                   //
+//////////////////////////////////////////////////////////////////
+torch::Tensor forward(torch::Tensor input,
+                      torch::Tensor bias) {
+    TORCH_CHECK(input.is_cuda(), "input must be CUDA");
+    TORCH_CHECK(bias.is_cuda(),  "bias must be CUDA");
+    TORCH_CHECK(input.scalar_type() == at::kFloat, "input must be float32");
+    TORCH_CHECK(bias.scalar_type()  == at::kFloat, "bias must be float32");
+
+    input = input.contiguous();
+    bias  = bias.contiguous();
+
+    const int C     = input.size(1);
+    const int H     = input.size(2);
+    const int W     = input.size(3);
+    const int hw    = H * W;
+    const int total = input.numel();
+
+    auto output = torch::empty_like(input);
+
+    const int threads = 256;
+    const int blocks  = (total + threads - 1) / threads;
+
+    relu_bias_add_fwd_kernel<<<blocks, threads>>>(
+        input.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        output.data_ptr<float>(),
+        C, hw, total
+    );
+    return output;
+}
+
+std::vector<torch::Tensor> backward(torch::Tensor grad_out,
+                                    torch::Tensor input,
+                                    torch::Tensor bias) {
+    TORCH_CHECK(grad_out.is_cuda(), "grad_out must be CUDA");
+    TORCH_CHECK(input.is_cuda(),    "input must be CUDA");
+    TORCH_CHECK(bias.is_cuda(),     "bias must be CUDA");
+
+    grad_out = grad_out.contiguous();
+    input    = input.contiguous();
+    bias     = bias.contiguous();
+
+    const int C     = input.size(1);
+    const int H     = input.size(2);
+    const int W     = input.size(3);
+    const int hw    = H * W;
+    const int total = input.numel();
+
+    auto grad_input = torch::empty_like(input);
+    auto grad_bias  = torch::zeros_like(bias);
+
+    const int threads = 256;
+    const int blocks  = (total + threads - 1) / threads;
+
+    relu_bias_add_bwd_kernel<<<blocks, threads>>>(
+        grad_out.data_ptr<float>(),
+        input.data_ptr<float>(),
+        grad_input.data_ptr<float>(),
+        grad_bias.data_ptr<float>(),
+        C, hw, total
+    );
+    return {grad_input, grad_bias};
+}
+"""
+
+# 3 ─────────────────────────────────── Kernel prototypes
+cpp_src = r"""
+#include <torch/extension.h>
+torch::Tensor forward(torch::Tensor input, torch::Tensor bias);
+std::vector<torch::Tensor> backward(torch::Tensor grad_out,
+                                    torch::Tensor input,
+                                    torch::Tensor bias);
+"""
+
+# 4 ─────────────────────────────────── Build / load
+relu_bias_add = load_inline(
+    name="relu_bias_add",
+    cpp_sources=cpp_src,
+    cuda_sources=source,
+    functions=["forward", "backward"],
+    with_cuda=True,
+    verbose=False,
+)
+
+# 5 ─────────────────────────────────── Optimised model
+class ModelNew(nn.Module):
+    """
+    Conv2d (with built-in bias) followed by fused ReLU + bias-add.
+    """
+    class _ReluBiasAddFunction(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, x, bias):
+            ctx.save_for_backward(x, bias)
+            return relu_bias_add.forward(x, bias)
+
+        @staticmethod
+        def backward(ctx, grad_out):
+            x, bias = ctx.saved_tensors
+            grad_x, grad_bias = relu_bias_add.backward(
+                grad_out.contiguous(), x, bias
+            )
+            return grad_x, grad_bias
+
+    def __init__(self, in_channels, out_channels, kernel_size, bias_shape=None):
+        super().__init__()
+        # Convolution with its own bias
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, bias=True)
+
+        if bias_shape is None:
+            bias_shape = (out_channels,)
+        # critical fix: initialise extra bias randomly (matches reference)
+        self.bias = nn.Parameter(torch.randn(*bias_shape))
+
+    def forward(self, x):
+        x = self.conv(x)
+        bias = self.bias
+        if bias.dim() == 1:
+            bias = bias.view(-1, 1, 1)
+        x = ModelNew._ReluBiasAddFunction.apply(x, bias)
+        return x
+```

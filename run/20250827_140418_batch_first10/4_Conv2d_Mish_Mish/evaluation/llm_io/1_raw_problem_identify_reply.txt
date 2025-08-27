@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Conv2d uses padding=1 instead of 0",
+  "why_it_matters": "Extra padding keeps spatial dims at 128x128, while reference shrinks to 126x126, causing shape mismatch and wrong outputs.",
+  "minimal_fix_hint": "remove padding argument (padding=0)"
+}
+```

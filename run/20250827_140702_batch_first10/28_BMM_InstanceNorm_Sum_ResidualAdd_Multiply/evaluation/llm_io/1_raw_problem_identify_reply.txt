@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Kernel normalizes over entire feature vector, not per-channel",
+  "why_it_matters": "InstanceNorm2d computes mean/variance separately for every channel; global reduction changes all normalized values, breaking parity.",
+  "minimal_fix_hint": "Perform per-channel reductions, one threadblock per (batch,channel)."
+}
+```

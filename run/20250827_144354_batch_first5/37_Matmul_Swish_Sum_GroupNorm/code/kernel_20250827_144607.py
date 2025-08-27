@@ -1,0 +1,98 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# ---------------------------------------------------------------------------
+# Inline CUDA kernel: fused Swish activation (x * sigmoid(x)) + bias addition
+# ---------------------------------------------------------------------------
+cuda_src = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__device__ __forceinline__ float sigmoidf(float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+
+__global__ void fused_swish_bias_kernel(const float* __restrict__ inp,
+                                        const float* __restrict__ bias,
+                                        float* __restrict__ out,
+                                        int rows, int cols) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = rows * cols;
+    if (idx >= total) return;
+
+    int col = idx % cols;                 // channel index (out_features)
+    float val = inp[idx];
+    float swish = val * sigmoidf(val);    // Swish activation
+    out[idx] = swish + bias[col];         // Add bias
+}
+
+torch::Tensor fused_swish_bias(torch::Tensor inp, torch::Tensor bias) {
+    TORCH_CHECK(inp.is_cuda(), "Input must be a CUDA tensor");
+    TORCH_CHECK(bias.is_cuda(), "Bias must be a CUDA tensor");
+    TORCH_CHECK(inp.dtype() == torch::kFloat32, "Only float32 supported");
+
+    const int rows = inp.size(0);
+    const int cols = inp.size(1);
+    const int total = rows * cols;
+
+    auto out = torch::empty_like(inp);
+
+    const int block_size = 256;
+    const int grid_size  = (total + block_size - 1) / block_size;
+
+    fused_swish_bias_kernel<<<grid_size, block_size>>>(inp.data_ptr<float>(),
+                                                       bias.data_ptr<float>(),
+                                                       out.data_ptr<float>(),
+                                                       rows,
+                                                       cols);
+    return out;
+}
+"""
+
+cpp_decl = "torch::Tensor fused_swish_bias(torch::Tensor inp, torch::Tensor bias);"
+
+# Compile the CUDA extension
+fused_swish_bias_ext = load_inline(
+    name="fused_swish_bias_ext",
+    cpp_sources=cpp_decl,
+    cuda_sources=cuda_src,
+    functions=["fused_swish_bias"],
+    extra_cflags=["-O3"],
+    verbose=False,
+)
+
+# ---------------------------------------------------------------------------
+# Optimized model using the fused CUDA kernel
+# ---------------------------------------------------------------------------
+class ModelNew(nn.Module):
+    """
+    Optimized model: Linear -> fused (Swish + bias) CUDA kernel -> GroupNorm
+    """
+    def __init__(self, in_features, out_features, num_groups, bias_shape):
+        super().__init__()
+        self.matmul = nn.Linear(in_features, out_features, bias=True).cuda()
+        self.bias   = nn.Parameter(torch.randn(bias_shape, device='cuda'))
+        self.group_norm = nn.GroupNorm(num_groups, out_features).cuda()
+        self._fused_swish_bias = fused_swish_bias_ext.fused_swish_bias
+
+    def forward(self, x):
+        x = self.matmul(x)
+        x = self._fused_swish_bias(x, self.bias)
+        x = self.group_norm(x)
+        return x
+
+# ---------------------------------------------------------------------------
+# Helper functions (kept identical to original interface)
+# ---------------------------------------------------------------------------
+batch_size = 8192
+in_features = 512
+out_features = 2048
+num_groups = 64
+bias_shape = (out_features,)
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features, device='cuda')]
+
+def get_init_inputs():
+    return [in_features, out_features, num_groups, bias_shape]

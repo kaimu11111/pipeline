@@ -1,0 +1,29 @@
+{
+  "avg_speedup": 1.0180312637283127,
+  "accuracy": 1.0,
+  "num_tasks": 3,
+  "tasks": [
+    {
+      "task": "KernelBench/temp3/28_BMM_InstanceNorm_Sum_ResidualAdd_Multiply.py",
+      "best_score": 1.0536375372406142,
+      "best_runnable": true,
+      "task_dir": "/home/wan00559/pipleline/run/20250827_144812_batch_first3/28_BMM_InstanceNorm_Sum_ResidualAdd_Multiply",
+      "figure": "/home/wan00559/pipleline/run/20250827_144812_batch_first3/28_BMM_InstanceNorm_Sum_ResidualAdd_Multiply/figures/28_BMM_InstanceNorm_Sum_ResidualAdd_Multiply_score.png"
+    },
+    {
+      "task": "KernelBench/temp3/29_Matmul_Mish_Mish.py",
+      "best_score": 1.00123843267356,
+      "best_runnable": true,
+      "task_dir": "/home/wan00559/pipleline/run/20250827_144812_batch_first3/29_Matmul_Mish_Mish",
+      "figure": "/home/wan00559/pipleline/run/20250827_144812_batch_first3/29_Matmul_Mish_Mish/figures/29_Matmul_Mish_Mish_score.png"
+    },
+    {
+      "task": "KernelBench/temp3/30_Gemm_GroupNorm_Hardtanh.py",
+      "best_score": 0.999217821270764,
+      "best_runnable": true,
+      "task_dir": "/home/wan00559/pipleline/run/20250827_144812_batch_first3/30_Gemm_GroupNorm_Hardtanh",
+      "figure": "/home/wan00559/pipleline/run/20250827_144812_batch_first3/30_Gemm_GroupNorm_Hardtanh/figures/30_Gemm_GroupNorm_Hardtanh_score.png"
+    }
+  ],
+  "timestamp": "2025-08-27 14:55:08"
+}

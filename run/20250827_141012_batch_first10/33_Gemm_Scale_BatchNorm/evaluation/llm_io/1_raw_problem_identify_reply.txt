@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Duplicate PYBIND11_MODULE definitions cause symbol clash",
+  "why_it_matters": "main.cpp and cuda.cu both define PyInit_scale_mul, the linker errors out, extension never builds or runs.",
+  "minimal_fix_hint": "Remove module block from cuda_src."
+}
+```

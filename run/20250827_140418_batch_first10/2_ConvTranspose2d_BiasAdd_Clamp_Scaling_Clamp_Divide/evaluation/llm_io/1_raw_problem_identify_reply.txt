@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Bias tensor is initialized on CUDA, not CPU",
+  "why_it_matters": "CPU and CUDA RNG streams differ; with identical seeds this yields different bias values, driving large output mismatches (~0.5).",
+  "minimal_fix_hint": "Create bias via torch.randn on CPU, then move to device."
+}
+```

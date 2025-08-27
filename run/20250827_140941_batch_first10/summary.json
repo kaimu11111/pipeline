@@ -1,0 +1,78 @@
+{
+  "avg_speedup": 1.462545981255538,
+  "accuracy": 1.0,
+  "num_tasks": 10,
+  "tasks": [
+    {
+      "task": "KernelBench/level2test3/11_ConvTranspose2d_BatchNorm_Tanh_MaxPool_GroupNorm.py",
+      "best_score": 1.056865015731009,
+      "best_runnable": true,
+      "task_dir": "/home/wan00559/pipleline/run/20250827_140941_batch_first10/11_ConvTranspose2d_BatchNorm_Tanh_MaxPool_GroupNorm",
+      "figure": "/home/wan00559/pipleline/run/20250827_140941_batch_first10/11_ConvTranspose2d_BatchNorm_Tanh_MaxPool_GroupNorm/figures/11_ConvTranspose2d_BatchNorm_Tanh_MaxPool_GroupNorm_score.png"
+    },
+    {
+      "task": "KernelBench/level2test3/12_Gemm_Multiply_LeakyReLU.py",
+      "best_score": 0.35808050356709153,
+      "best_runnable": true,
+      "task_dir": "/home/wan00559/pipleline/run/20250827_140941_batch_first10/12_Gemm_Multiply_LeakyReLU",
+      "figure": "/home/wan00559/pipleline/run/20250827_140941_batch_first10/12_Gemm_Multiply_LeakyReLU/figures/12_Gemm_Multiply_LeakyReLU_score.png"
+    },
+    {
+      "task": "KernelBench/level2test3/13_ConvTranspose3d_Mean_Add_Softmax_Tanh_Scaling.py",
+      "best_score": 0.8984715977391805,
+      "best_runnable": true,
+      "task_dir": "/home/wan00559/pipleline/run/20250827_140941_batch_first10/13_ConvTranspose3d_Mean_Add_Softmax_Tanh_Scaling",
+      "figure": "/home/wan00559/pipleline/run/20250827_140941_batch_first10/13_ConvTranspose3d_Mean_Add_Softmax_Tanh_Scaling/figures/13_ConvTranspose3d_Mean_Add_Softmax_Tanh_Scaling_score.png"
+    },
+    {
+      "task": "KernelBench/level2test3/14_Gemm_Divide_Sum_Scaling.py",
+      "best_score": 7.708881684796169,
+      "best_runnable": true,
+      "task_dir": "/home/wan00559/pipleline/run/20250827_140941_batch_first10/14_Gemm_Divide_Sum_Scaling",
+      "figure": "/home/wan00559/pipleline/run/20250827_140941_batch_first10/14_Gemm_Divide_Sum_Scaling/figures/14_Gemm_Divide_Sum_Scaling_score.png"
+    },
+    {
+      "task": "KernelBench/level2test3/15_ConvTranspose3d_BatchNorm_Subtract.py",
+      "best_score": 0.15686471097412577,
+      "best_runnable": true,
+      "task_dir": "/home/wan00559/pipleline/run/20250827_140941_batch_first10/15_ConvTranspose3d_BatchNorm_Subtract",
+      "figure": "/home/wan00559/pipleline/run/20250827_140941_batch_first10/15_ConvTranspose3d_BatchNorm_Subtract/figures/15_ConvTranspose3d_BatchNorm_Subtract_score.png"
+    },
+    {
+      "task": "KernelBench/level2test3/16_ConvTranspose2d_Mish_Add_Hardtanh_Scaling.py",
+      "best_score": 1.3657889049991236,
+      "best_runnable": true,
+      "task_dir": "/home/wan00559/pipleline/run/20250827_140941_batch_first10/16_ConvTranspose2d_Mish_Add_Hardtanh_Scaling",
+      "figure": "/home/wan00559/pipleline/run/20250827_140941_batch_first10/16_ConvTranspose2d_Mish_Add_Hardtanh_Scaling/figures/16_ConvTranspose2d_Mish_Add_Hardtanh_Scaling_score.png"
+    },
+    {
+      "task": "KernelBench/level2test3/17_Conv2d_InstanceNorm_Divide.py",
+      "best_score": 1.2172781459583468,
+      "best_runnable": true,
+      "task_dir": "/home/wan00559/pipleline/run/20250827_140941_batch_first10/17_Conv2d_InstanceNorm_Divide",
+      "figure": "/home/wan00559/pipleline/run/20250827_140941_batch_first10/17_Conv2d_InstanceNorm_Divide/figures/17_Conv2d_InstanceNorm_Divide_score.png"
+    },
+    {
+      "task": "KernelBench/level2test3/18_Matmul_Sum_Max_AvgPool_LogSumExp_LogSumExp.py",
+      "best_score": 0.5329540266507758,
+      "best_runnable": true,
+      "task_dir": "/home/wan00559/pipleline/run/20250827_140941_batch_first10/18_Matmul_Sum_Max_AvgPool_LogSumExp_LogSumExp",
+      "figure": "/home/wan00559/pipleline/run/20250827_140941_batch_first10/18_Matmul_Sum_Max_AvgPool_LogSumExp_LogSumExp/figures/18_Matmul_Sum_Max_AvgPool_LogSumExp_LogSumExp_score.png"
+    },
+    {
+      "task": "KernelBench/level2test3/19_ConvTranspose2d_GELU_GroupNorm.py",
+      "best_score": 0.2732530185169892,
+      "best_runnable": true,
+      "task_dir": "/home/wan00559/pipleline/run/20250827_140941_batch_first10/19_ConvTranspose2d_GELU_GroupNorm",
+      "figure": "/home/wan00559/pipleline/run/20250827_140941_batch_first10/19_ConvTranspose2d_GELU_GroupNorm/figures/19_ConvTranspose2d_GELU_GroupNorm_score.png"
+    },
+    {
+      "task": "KernelBench/level2test3/20_ConvTranspose3d_Sum_ResidualAdd_Multiply_ResidualAdd.py",
+      "best_score": 1.057022203622567,
+      "best_runnable": true,
+      "task_dir": "/home/wan00559/pipleline/run/20250827_140941_batch_first10/20_ConvTranspose3d_Sum_ResidualAdd_Multiply_ResidualAdd",
+      "figure": "/home/wan00559/pipleline/run/20250827_140941_batch_first10/20_ConvTranspose3d_Sum_ResidualAdd_Multiply_ResidualAdd/figures/20_ConvTranspose3d_Sum_ResidualAdd_Multiply_ResidualAdd_score.png"
+    }
+  ],
+  "timestamp": "2025-08-27 14:42:06"
+}

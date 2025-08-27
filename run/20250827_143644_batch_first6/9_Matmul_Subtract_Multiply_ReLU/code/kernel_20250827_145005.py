@@ -1,0 +1,90 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# ---------------------------------------------------------------------
+# CUDA kernel: fused (x - subtract_value) * multiply_value followed by ReLU
+# ---------------------------------------------------------------------
+cuda_source = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void fused_scalar_relu_kernel(const float* __restrict__ in,
+                                         float* __restrict__ out,
+                                         const float sub_val,
+                                         const float mul_val,
+                                         const int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        float v = (in[idx] - sub_val) * mul_val;
+        out[idx] = v > 0.0f ? v : 0.0f;
+    }
+}
+
+torch::Tensor fused_scalar_relu(torch::Tensor x,
+                                const float sub_val,
+                                const float mul_val) {
+    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
+    TORCH_CHECK(x.scalar_type() == at::ScalarType::Float,
+                "Only float32 tensors are supported");
+
+    auto out = torch::empty_like(x);
+    const int size = x.numel();
+    const int block_size = 256;
+    const int grid_size  = (size + block_size - 1) / block_size;
+
+    fused_scalar_relu_kernel<<<grid_size, block_size>>>(
+        x.data_ptr<float>(),
+        out.data_ptr<float>(),
+        sub_val,
+        mul_val,
+        size);
+
+    return out;
+}
+"""
+
+cpp_declaration = "torch::Tensor fused_scalar_relu(torch::Tensor x, const float sub_val, const float mul_val);"
+
+fused_ops = load_inline(
+    name="fused_scalar_relu_ops",
+    cpp_sources=cpp_declaration,
+    cuda_sources=cuda_source,
+    functions=["fused_scalar_relu"],
+    verbose=False,
+)
+
+# ---------------------------------------------------------------------
+# Optimised Model
+# ---------------------------------------------------------------------
+class ModelNew(nn.Module):
+    """
+    Optimised model that keeps the nn.Linear layer but replaces the
+    (x - subtract_value) * multiply_value followed by ReLU chain with a
+    single custom CUDA kernel.
+    """
+    def __init__(self, in_features, out_features, subtract_value, multiply_value):
+        super(ModelNew, self).__init__()
+        self.linear = nn.Linear(in_features, out_features).cuda()
+        self.sub_val = float(subtract_value)
+        self.mul_val = float(multiply_value)
+
+    def forward(self, x):
+        x = self.linear(x)
+        x = fused_ops.fused_scalar_relu(x, self.sub_val, self.mul_val)
+        return x
+
+# ---------------------------------------------------------------------
+# Helpers that mirror the original interface
+# ---------------------------------------------------------------------
+batch_size = 512
+in_features = 4096
+out_features = 4096
+subtract_value = 2.0
+multiply_value = 1.5
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features, device='cuda')]
+
+def get_init_inputs():
+    return [in_features, out_features, subtract_value, multiply_value]

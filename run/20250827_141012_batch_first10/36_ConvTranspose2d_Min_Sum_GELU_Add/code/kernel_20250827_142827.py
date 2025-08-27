@@ -1,0 +1,121 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# ---------------------------------------------------------------------------
+# CUDA / C++ source for the fused kernel:  min (along C)  ->  sum (along H)
+#                                        ->  GELU         ->  + bias
+# ---------------------------------------------------------------------------
+cuda_src = r"""
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__device__ __forceinline__ float gelu(float x) {
+    const float kAlpha = 0.7978845608f;          // sqrt(2/pi)
+    const float kBeta  = 0.044715f;
+    return 0.5f * x * (1.f + tanhf(kAlpha * (x + kBeta * x * x * x)));
+}
+
+__global__ void fused_kernel(
+        const float* __restrict__ x,
+        const float* __restrict__ bias,
+        float* __restrict__ out,
+        int N, int C, int H, int W)
+{
+    const int linear_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (linear_idx >= N * W) return;
+
+    const int n = linear_idx / W;
+    const int w = linear_idx % W;
+
+    float sum_h = 0.f;
+
+    for (int h = 0; h < H; ++h) {
+        // index for (n, 0, h, w)
+        int offset = ((n * C * H + 0 * H + h) * W) + w;
+        float min_val = x[offset];
+
+        // min across channels
+        for (int c = 1; c < C; ++c) {
+            offset += H * W;  // move to next channel (same n, h, w)
+            float v = x[offset];
+            if (v < min_val) min_val = v;
+        }
+        sum_h += min_val;
+    }
+
+    float val = gelu(sum_h) + bias[0];
+    out[n * W + w] = val;   // stored as (N,1,1,W) contiguous
+}
+
+torch::Tensor fused_min_sum_gelu_bias_cuda(torch::Tensor x,
+                                           torch::Tensor bias) {
+    TORCH_CHECK(x.is_cuda(), "input must be CUDA tensor");
+    TORCH_CHECK(bias.is_cuda(), "bias must be CUDA tensor");
+    TORCH_CHECK(x.scalar_type() == torch::kFloat32, "input must be float32");
+
+    const int N = x.size(0);
+    const int C = x.size(1);
+    const int H = x.size(2);
+    const int W = x.size(3);
+
+    auto out = torch::empty({N, 1, 1, W}, x.options());
+
+    const int threads = 256;
+    const int blocks  = (N * W + threads - 1) / threads;
+
+    fused_kernel<<<blocks, threads>>>(
+        x.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        out.data_ptr<float>(),
+        N, C, H, W);
+
+    return out;
+}
+"""
+
+cpp_decl = r"""
+torch::Tensor fused_min_sum_gelu_bias_cuda(torch::Tensor x,
+                                           torch::Tensor bias);
+"""
+
+fused_ops = load_inline(
+    name="fused_min_sum_gelu_bias",
+    cpp_sources=cpp_decl,
+    cuda_sources=cuda_src,
+    functions=["fused_min_sum_gelu_bias_cuda"],
+    verbose=False,
+)
+
+# ---------------------------------------------------------------------------
+# Optimised model
+# ---------------------------------------------------------------------------
+class ModelNew(nn.Module):
+    """
+    Optimised version of the original model with a fused custom CUDA kernel
+    replacing: min (C) -> sum (H) -> GELU -> bias add.
+    """
+    def __init__(self,
+                 in_channels,
+                 out_channels,
+                 kernel_size,
+                 stride,
+                 padding,
+                 output_padding,
+                 bias_shape):
+        super().__init__()
+        self.conv_transpose = nn.ConvTranspose2d(
+            in_channels, out_channels, kernel_size,
+            stride, padding, output_padding
+        )
+        # bias is still a learnable parameter
+        self.bias = nn.Parameter(torch.randn(bias_shape, device='cuda'))
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        # ensure contiguous memory layout for the kernel
+        x = x.contiguous()
+        x = fused_ops.fused_min_sum_gelu_bias_cuda(x, self.bias)
+        return x

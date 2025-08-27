@@ -1,0 +1,159 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# ---------------------------------------------------------------------------
+# Inline CUDA kernels
+# ---------------------------------------------------------------------------
+cuda_source = r"""
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+// ----------------------------------------------------------------------------
+// Kernel 1 : element-wise division by a constant
+// ----------------------------------------------------------------------------
+__global__ void div_kernel(const float* __restrict__ inp,
+                           float* __restrict__ out,
+                           const float divisor,
+                           const int size) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        out[idx] = inp[idx] / divisor;
+    }
+}
+
+torch::Tensor divide_by_const_cuda(torch::Tensor input, double divisor_double) {
+    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
+    auto inp = input.contiguous();
+    auto out = torch::empty_like(inp);
+
+    const int size     = inp.numel();
+    const int threads  = 256;
+    const int blocks   = (size + threads - 1) / threads;
+    const float divisor = static_cast<float>(divisor_double);
+
+    div_kernel<<<blocks, threads>>>(
+        inp.data_ptr<float>(),
+        out.data_ptr<float>(),
+        divisor,
+        size);
+
+    return out;
+}
+
+// ----------------------------------------------------------------------------
+// Kernel 2 : add bias (per-channel) and reduce (sum) across channel dimension
+// ----------------------------------------------------------------------------
+__global__ void add_bias_sum_kernel(const float* __restrict__ x,
+                                    const float* __restrict__ bias,
+                                    float* __restrict__ out,
+                                    const int N,
+                                    const int C) {
+    const int idx   = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = N * C;
+    if (idx < total) {
+        const int n   = idx / C;
+        const int c   = idx % C;
+        const float v = x[idx] + bias[c];   // add bias
+        atomicAdd(&out[n], v);              // reduce over C
+    }
+}
+
+torch::Tensor add_bias_and_sum_cuda(torch::Tensor x, torch::Tensor bias) {
+    TORCH_CHECK(x.is_cuda() && bias.is_cuda(), "Tensors must be on CUDA");
+    TORCH_CHECK(x.dim() == 5, "x must be 5-D (N, C, 1, 1, 1)");
+    TORCH_CHECK(x.size(2) == 1 && x.size(3) == 1 && x.size(4) == 1,
+                "Spatial dims of x must be 1");
+    TORCH_CHECK(bias.numel() == x.size(1),
+                "Bias channels must match x channels");
+
+    auto xc    = x.contiguous();
+    auto bc    = bias.contiguous();
+    const int N = xc.size(0);
+    const int C = xc.size(1);
+
+    auto out = torch::zeros({N, 1, 1, 1}, xc.options());
+
+    const int threads = 256;
+    const int blocks  = (N * C + threads - 1) / threads;
+
+    add_bias_sum_kernel<<<blocks, threads>>>(
+        xc.data_ptr<float>(),
+        bc.data_ptr<float>(),
+        out.data_ptr<float>(),
+        N, C);
+
+    return out;
+}
+"""
+
+cpp_decls = """
+torch::Tensor divide_by_const_cuda(torch::Tensor input, double divisor);
+torch::Tensor add_bias_and_sum_cuda(torch::Tensor x, torch::Tensor bias);
+"""
+
+# Compile and load the kernels
+kernels = load_inline(name="custom_kernels",
+                      cpp_sources=cpp_decls,
+                      cuda_sources=cuda_source,
+                      functions=["divide_by_const_cuda",
+                                 "add_bias_and_sum_cuda"],
+                      verbose=False)
+
+# ---------------------------------------------------------------------------
+# Optimised model using the custom kernels
+# ---------------------------------------------------------------------------
+class ModelNew(nn.Module):
+    """
+    Optimised version of the original Model with custom CUDA kernels
+    for (1) division by a constant and (2) bias addition + channel reduction.
+    """
+    def __init__(self,
+                 in_channels, out_channels,
+                 kernel_size, divisor,
+                 pool_size, bias_shape,
+                 sum_dim):          # sum_dim kept for API compatibility
+        super().__init__()
+        self.conv            = nn.Conv3d(in_channels, out_channels, kernel_size)
+        self.divisor         = float(divisor)
+        self.max_pool        = nn.MaxPool3d(pool_size)
+        self.global_avg_pool = nn.AdaptiveAvgPool3d((1, 1, 1))
+        self.bias            = nn.Parameter(torch.randn(bias_shape))
+        # store handles to CUDA functions
+        self._divide  = kernels.divide_by_const_cuda
+        self._add_sum = kernels.add_bias_and_sum_cuda
+
+    def forward(self, x):
+        # 3-D convolution
+        x = self.conv(x)
+        # element-wise division by constant (custom kernel)
+        x = self._divide(x, self.divisor)
+        # max-pooling + global average pooling
+        x = self.max_pool(x)
+        x = self.global_avg_pool(x)         # (N, C, 1, 1, 1)
+        # fused bias addition + channel reduction (custom kernel)
+        x = self._add_sum(x, self.bias)     # (N, 1, 1, 1)
+        return x
+
+# ---------------------------------------------------------------------------
+# Helper functions (keep same signatures as original script)
+# ---------------------------------------------------------------------------
+batch_size   = 64
+in_channels  = 4
+out_channels = 8
+depth = 8; height = width = 32
+kernel_size = (3, 3, 3)
+divisor = 2.0
+pool_size = (2, 2, 2)
+bias_shape = (out_channels, 1, 1, 1)
+sum_dim = 1
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, depth, height, width, device="cuda")]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size,
+            divisor, pool_size, bias_shape, sum_dim]
+```

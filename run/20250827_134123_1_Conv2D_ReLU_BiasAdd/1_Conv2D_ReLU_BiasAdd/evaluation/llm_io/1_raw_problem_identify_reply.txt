@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Conv2d uses padding=1 instead of 0",
+  "why_it_matters": "Extra padding enlarges feature maps to 64×64 vs. reference 62×62, breaking shape and numerical correctness.",
+  "minimal_fix_hint": "Set padding=0 (default) in ModelNew conv."
+}
+```

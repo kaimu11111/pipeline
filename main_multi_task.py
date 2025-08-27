@@ -15,9 +15,9 @@ matplotlib.use("Agg")  # headless save
 import matplotlib.pyplot as plt
 
 from agents.query_server import query_server
-from prompts.generate_custom_cuda import build_seed_prompt, system_prompt
+from prompts.generate_custom_cuda import build_seed_prompt, default_system_prompt
 from utils.compile_and_run import compare_and_bench
-from utils.kernel_io import extract_code_block, save_kernel_code
+from utils.kernel_io import extract_code_block, save_kernel_code, extract_json
 from scripts.individual import KernelIndividual  # adjust path if needed
 from prompts.error import build_error_prompt
 from prompts.optimization import build_optimization_prompt
@@ -113,10 +113,12 @@ def _build_history_block(code_dir: Path, keep_last: int = 10) -> str:
 
 # ------------------- LLM & eval steps ------------------
 def _make_llm_caller(args):
-    def call_llm(prompt: str, sys_prompt: str = system_prompt) -> str:
+
+    def call_llm(prompt: str, sys_prompt: Optional[str] = None) -> str:
+        sp = default_system_prompt if sys_prompt is None else sys_prompt
         return query_server(
             prompt=prompt,
-            system_prompt=sys_prompt,
+            system_prompt=sp,
             server_type=args.server_type,
             model_name=args.model_name,
             max_tokens=args.max_tokens,
@@ -128,17 +130,23 @@ def _make_llm_caller(args):
     return call_llm
 
 
-def _llm_to_kernel(prompt: str, code_dir: Path, call_llm, io_dir: Path, round_idx) -> KernelIndividual:
+def _llm_to_kernel(
+    prompt: str,
+    code_dir: Path,
+    call_llm,
+    io_dir: Path,
+    round_idx,
+    sys_prompt: Optional[str] = None,   # 新增：可选系统提示
+) -> KernelIndividual:
     """LLM -> code -> save -> KernelIndividual（不做评测）"""
-    raw = call_llm(prompt)
-    reply_file = io_dir/ f"{round_idx}_raw_reply.txt"
+    raw = call_llm(prompt, sys_prompt=sys_prompt)  # 传给 call_llm
+    reply_file = io_dir / f"{round_idx}_raw_reply.txt"
     reply_file.write_text(raw, encoding="utf-8")
     code = extract_code_block(raw) or raw  # fallback
     path = save_kernel_code(code, code_dir)
     ind = KernelIndividual(code)
     ind.code_path = path  # type: ignore[attr-defined]
     return ind
-
 
 # ================== 顶层 worker：必须放在模块顶层，不能写在函数里 ==================
 def _bench_worker_entry(test_py: str,
@@ -392,9 +400,20 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                 '''
                 Add judge here for the problem identifing, after get the problem list, give it to the repair_prompt
                 '''
+                problem_system_prompt, problem_prompt = build_correctness_prompts(error_log=error_log,
+                                                                                  arch_path = task_path,
+                                                                                  cuda_code = current_kernel.code)
+                prompt_file = io_dir / f"round{round_idx:03d}_problem_identify_prompt.txt"
+                prompt_file.write_text(problem_prompt, encoding="utf-8")
+                raw = call_llm(problem_prompt,problem_system_prompt)
+                reply_file = io_dir / f"{round_idx}_raw_problem_identify_reply.txt"
+                reply_file.write_text(raw, encoding="utf-8")
+                problem_json = extract_json(raw)
+                
                 repair_prompt = build_error_prompt(
                     old_code=current_kernel.code,
                     error_log=error_log,
+                    problem = problem_json,
                     gpu_name=args.gpu,
                 )
                 prompt_file = io_dir / f"round{round_idx:03d}_repair_prompt.txt"

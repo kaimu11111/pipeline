@@ -1,0 +1,118 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# ------------------------------------------------------------------
+# CUDA kernel: fuse min-with-constant + bias-addition + scaling
+# ------------------------------------------------------------------
+cuda_src = r"""
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+__global__ void fused_min_bias_scale_kernel(const float* __restrict__ x,
+                                            const float* __restrict__ bias,
+                                            const float  const_val,
+                                            const float  scale,
+                                            float* __restrict__ y,
+                                            const int    N,
+                                            const int    C,
+                                            const int    H,
+                                            const int    W) {
+    const int idx   = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = N * C * H * W;
+    if (idx >= total) return;
+
+    const int HW = H * W;
+    const int c  = (idx / HW) % C;
+
+    float v = x[idx];
+    v = v < const_val ? v : const_val;  // x = min(x, const_val)
+    v += bias[c];                       // x = x + bias
+    v *= scale;                         // x = x * scale
+    y[idx] = v;
+}
+
+torch::Tensor fused_min_bias_scale_cuda(torch::Tensor x,
+                                        torch::Tensor bias,
+                                        float const_val,
+                                        float scale) {
+    TORCH_CHECK(x.is_cuda(),   "Input tensor must be CUDA");
+    TORCH_CHECK(bias.is_cuda(),"Bias tensor must be CUDA");
+    TORCH_CHECK(x.scalar_type() == torch::kFloat, "Only float32 is supported");
+
+    const int N = x.size(0);
+    const int C = x.size(1);
+    const int H = x.size(2);
+    const int W = x.size(3);
+
+    auto y = torch::empty_like(x);
+
+    const int total = N * C * H * W;
+    const int block = 256;
+    const int grid  = (total + block - 1) / block;
+
+    fused_min_bias_scale_kernel<<<grid, block>>>(
+        x.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        const_val,
+        scale,
+        y.data_ptr<float>(),
+        N, C, H, W
+    );
+    return y;
+}
+"""
+
+cpp_src = "torch::Tensor fused_min_bias_scale_cuda(torch::Tensor x, torch::Tensor bias, float const_val, float scale);"
+
+# Compile & load the fused CUDA kernel
+fused_ops = load_inline(
+    name="fused_min_bias_scale",
+    cpp_sources=cpp_src,
+    cuda_sources=cuda_src,
+    functions=["fused_min_bias_scale_cuda"],
+    verbose=False,
+)
+
+# ------------------------------------------------------------------
+# Optimised PyTorch module using the fused CUDA kernel
+# ------------------------------------------------------------------
+class ModelNew(nn.Module):
+    """
+    Optimised model: retains the efficient cuDNN convolution but fuses the
+    element-wise min, bias add, and scaling operations into a single CUDA kernel.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size,
+                 constant_value, bias_shape, scaling_factor):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.constant_value = float(constant_value)
+        self.scaling_factor = float(scaling_factor)
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = fused_ops.fused_min_bias_scale_cuda(
+            x, self.bias, self.constant_value, self.scaling_factor
+        )
+        return x
+
+# ------------------------------------------------------------------
+# Helper functions & default config (unchanged from original script)
+# ------------------------------------------------------------------
+batch_size = 64
+in_channels = 32
+out_channels = 64
+height = width = 64
+kernel_size = 3
+constant_value = 0.5
+bias_shape = (out_channels, 1, 1)
+scaling_factor = 2.0
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width).cuda()]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size,
+            constant_value, bias_shape, scaling_factor]

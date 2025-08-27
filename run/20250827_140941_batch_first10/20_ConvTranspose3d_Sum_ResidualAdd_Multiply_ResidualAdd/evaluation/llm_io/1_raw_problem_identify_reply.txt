@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Kernel processes only C*inner, ignores batch N",
+  "why_it_matters": "Threads with idx >= C*inner (all later batches) exit early, leaving y uninitialized → garbage/NaNs and wrong outputs.",
+  "minimal_fix_hint": "Pass N and use total = N*C*inner in kernel"
+}
+```

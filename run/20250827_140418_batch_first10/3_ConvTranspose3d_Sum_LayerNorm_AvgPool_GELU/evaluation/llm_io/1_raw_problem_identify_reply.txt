@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "LayerNorm axes wrong (channels vs last dim)",
+  "why_it_matters": "Kernel normalises across channel dimension, while PyTorch LayerNorm normalises across last dimension (width), giving different means/variances hence mismatching outputs and gradients.",
+  "minimal_fix_hint": "compute mean/var over last dim or permute tensor"
+}
+```
