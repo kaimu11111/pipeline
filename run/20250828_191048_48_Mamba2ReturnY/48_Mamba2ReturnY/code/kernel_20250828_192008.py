@@ -1,0 +1,218 @@
+# 1. Imports ──────────────────────────────────────────────────────────
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# 2. source ────────────────────────────────────────────────────────────
+source = r"""
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <ATen/cuda/CUDAContext.h>
+
+template<typename scalar_t>
+__device__ __forceinline__ scalar_t my_exp(scalar_t v);
+template<>
+__device__ __forceinline__ float  my_exp<float >(float  v){ return expf(v); }
+template<>
+__device__ __forceinline__ double my_exp<double>(double v){ return exp (v); }
+
+/*
+ * Input :  x  - (B, H, C, L)
+ * Output:  y  - (B, H, C, L, L) where
+ *          y[b,h,c,i,j] = exp( sum_{k=j+1}^{i} x[b,h,c,k] ) if j<=i
+ *                       = 0                                otherwise
+ * Note   : the diagonal is therefore exp(0) == 1.
+ */
+
+template<typename scalar_t>
+__global__ void segsum_exp_kernel(const scalar_t *__restrict__ x,
+                                  scalar_t       *__restrict__ y,
+                                  const int B,
+                                  const int H,
+                                  const int C,
+                                  const int L)
+{
+    /* ----------------- block identification ----------------------- */
+    const int bhc = blockIdx.x;              // one block per (b,h,c)
+    const int b   = bhc / (H*C);
+    const int tmp = bhc % (H*C);
+    const int h   = tmp / C;
+    const int c   = tmp % C;
+
+    /* ------------------------- pointers --------------------------- */
+    const scalar_t *x_ptr = x + (((b*H + h)*C + c)*L);
+    scalar_t       *y_ptr = y + ((((b*H + h)*C + c)*L)*L);
+
+    /* ------------ load x into shared memory & prefix-sum ---------- */
+    extern __shared__ char smem[];
+    scalar_t *prefix = reinterpret_cast<scalar_t *>(smem);
+
+    if (threadIdx.x < L) {
+        prefix[threadIdx.x] = x_ptr[threadIdx.x];
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0){
+        for(int i = 1; i < L; ++i){
+            prefix[i] += prefix[i-1];
+        }
+    }
+    __syncthreads();
+
+    /* ---------------- compute all (i,j) pairs --------------------- */
+    const int total = L * L;                 // elements per (b,h,c) matrix
+    for(int idx = threadIdx.x; idx < total; idx += blockDim.x){
+        const int i = idx / L;               // row
+        const int j = idx % L;               // col
+
+        scalar_t out_val;
+        if (j <= i){
+            scalar_t seg = (j < i) ? (prefix[i] - prefix[j]) : scalar_t(0); // exclude x_j
+            out_val = my_exp(seg);                                          // exp(0)=1 on diag
+        }else{
+            out_val = scalar_t(0);
+        }
+        y_ptr[i*L + j] = out_val;
+    }
+}
+
+/* ------------------------- host wrapper --------------------------- */
+torch::Tensor segsum_exp_cuda(torch::Tensor x){
+    TORCH_CHECK(x.dim() == 4, "Input must be 4-D (B,H,C,L)");
+    TORCH_CHECK(x.is_cuda(), "Input must reside on CUDA device");
+    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
+
+    const int B = x.size(0);
+    const int H = x.size(1);
+    const int C = x.size(2);
+    const int L = x.size(3);
+
+    auto y = torch::empty({B, H, C, L, L}, x.options());
+
+    const int blocks  = B * H * C;
+    const int threads = 256;
+    const size_t shmem = static_cast<size_t>(L) * sizeof(double); // over-allocate, covers float/double
+
+    AT_DISPATCH_FLOATING_TYPES(x.scalar_type(), "segsum_exp_cuda_launch", ([&](){
+        segsum_exp_kernel<scalar_t><<<blocks, threads, shmem>>>(
+            x.data_ptr<scalar_t>(),
+            y.data_ptr<scalar_t>(),
+            B, H, C, L);
+    }));
+    return y;
+}
+"""
+
+# 3. cpp_src ──────────────────────────────────────────────────────────
+cpp_src = "torch::Tensor segsum_exp_cuda(torch::Tensor x);"
+
+# 4. load_inline ──────────────────────────────────────────────────────
+_segsum_exp_mod = load_inline(
+    name         = "segsum_exp_cuda_module",
+    cpp_sources  = cpp_src,
+    cuda_sources = source,
+    functions    = ["segsum_exp_cuda"],
+    verbose      = False,
+)
+
+# 5. ModelNew ─────────────────────────────────────────────────────────
+class ModelNew(nn.Module):
+    def __init__(self, batch_size, seq_length, n_heads, d_head, d_state, block_len=64):
+        super().__init__()
+        assert seq_length % block_len == 0, "Sequence length must be divisible by block length"
+
+        self.batch_size  = batch_size
+        self.seq_length  = seq_length
+        self.n_heads     = n_heads
+        self.d_head      = d_head
+        self.d_state     = d_state
+        self.block_len   = block_len
+        self.n_chunks    = seq_length // block_len
+
+        # Parameters
+        self.A = nn.Parameter(torch.randn(batch_size, seq_length, n_heads))
+        self.B = nn.Parameter(torch.randn(batch_size, seq_length, n_heads, d_state))
+        self.C = nn.Parameter(torch.randn(batch_size, seq_length, n_heads, d_state))
+
+        # Expose CUDA kernel
+        self._segsum_exp = _segsum_exp_mod.segsum_exp_cuda
+
+    # ---------------------- python reference ------------------------
+    @staticmethod
+    def _segsum_python(x: torch.Tensor) -> torch.Tensor:
+        """
+        Naive segment-sum (excludes element j).
+        Works on tensors with shape (..., T)
+        """
+        T          = x.size(-1)
+        x_cumsum   = torch.cumsum(x, dim=-1)
+        x_segsum   = x_cumsum[..., :, None] - x_cumsum[..., None, :]
+        mask       = torch.tril(torch.ones(T, T, device=x.device, dtype=bool))
+        x_segsum   = x_segsum.masked_fill(~mask, -torch.inf)
+        return x_segsum
+
+    # ----------------------------- forward --------------------------
+    def forward(self, X: torch.Tensor, initial_states=None):
+        B, S, H, P = X.shape
+        C_chunks   = self.n_chunks
+        L_block    = self.block_len
+
+        # 1. Chunk/Block reorganisation (reshape, NOT einsum)
+        X_blocks = X.view(B, C_chunks, L_block, H, P).contiguous()            # (b, c, l, h, p)
+        A_blocks = self.A.view(B, C_chunks, L_block, H).contiguous()          # (b, c, l, h)
+        B_blocks = self.B.view(B, C_chunks, L_block, H, self.d_state).contiguous()  # (b, c, l, h, n)
+        C_blocks = self.C.view(B, C_chunks, L_block, H, self.d_state).contiguous()  # (b, c, l, h, n)
+
+        # A_blocks : (b, h, c, l)
+        A_blocks = A_blocks.permute(0, 3, 1, 2).contiguous()                  # (b, h, c, l)
+
+        # 2. Diagonal block weights (CUDA)
+        L = self._segsum_exp(A_blocks)                                        # (b, h, c, l, l)
+        A_cumsum = torch.cumsum(A_blocks, dim=-1)                             # (b, h, c, l)
+
+        # 3. Diagonal outputs
+        Y_diag = torch.einsum(
+            "b c l h n, b c s h n, b h c l s, b c s h p -> b c l h p",
+            C_blocks,
+            B_blocks,
+            L,
+            X_blocks,
+        )                                                                     # (b, c, l, h, p)
+
+        # 4. Intra-chunk states
+        decay_states = torch.exp(A_cumsum[:, :, :, -1:].sub(A_cumsum))        # (b, h, c, l)
+        states = torch.einsum(
+            "b c l h n, b h c l, b c l h p -> b c h p n",
+            B_blocks,
+            decay_states,
+            X_blocks,
+        )                                                                     # (b, c, h, p, n)
+
+        # 5. Inter-chunk recurrence
+        if initial_states is None:
+            initial_states = torch.zeros_like(states[:, :1])                  # (b, 1, h, p, n)
+        states = torch.cat([initial_states, states], dim=1)                   # (b, c+1, h, p, n)
+
+        last_A = A_cumsum[:, :, :, -1]                                        # (b, h, c)
+        decay_chunk = torch.exp(
+            self._segsum_python(nn.functional.pad(last_A, (1, 0)))
+        )                                                                     # (b, h, c+1, c+1)
+
+        new_states = torch.einsum("b h z c, b c h p n -> b z h p n", decay_chunk, states)
+        states = new_states[:, :-1]                                           # (b, c, h, p, n)
+
+        # 6. State-to-output
+        state_decay_out = torch.exp(A_cumsum)                                 # (b, h, c, l)
+        Y_off = torch.einsum(
+            "b c l h n, b c h p n, b h c l -> b c l h p",
+            C_blocks,
+            states,
+            state_decay_out,
+        )                                                                     # (b, c, l, h, p)
+
+        # 7. Combine & reshape back
+        Y = (Y_diag + Y_off).permute(0, 2, 1, 3, 4).reshape(
+            B, self.seq_length, H, P
+        )                                                                     # (b, s, h, p)
+        return Y

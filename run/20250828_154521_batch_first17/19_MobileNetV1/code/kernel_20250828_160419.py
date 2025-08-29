@@ -1,0 +1,187 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# ---------------------------------------------------------------------------
+# 1. Build the CUDA extension – fused BatchNorm (inference) + ReLU
+# ---------------------------------------------------------------------------
+cuda_src = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// Element-wise fused BatchNorm (inference) + ReLU
+//   y = relu(x * scale[c] + shift[c])
+// layout: NCHW (contiguous)
+__global__ void bn_relu_kernel(
+        const float* __restrict__ x,
+        const float* __restrict__ scale,
+        const float* __restrict__ shift,
+        float* __restrict__ y,
+        const int C,
+        const int spatial,
+        const long long numel) {
+
+    const long long idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= numel) return;
+
+    const int c = (idx / spatial) % C;
+    float val = x[idx] * scale[c] + shift[c];
+    y[idx] = val > 0.f ? val : 0.f;
+}
+
+torch::Tensor fused_bn_relu_cuda(torch::Tensor x,
+                                 torch::Tensor scale,
+                                 torch::Tensor shift) {
+    TORCH_CHECK(x.is_cuda(),   "x must be a CUDA tensor");
+    TORCH_CHECK(scale.is_cuda() && shift.is_cuda(),
+                "scale and shift must be CUDA tensors");
+    TORCH_CHECK(x.scalar_type() == torch::kFloat32,
+                "only float32 is supported");
+
+    const int  N   = x.size(0);
+    const int  C   = x.size(1);
+    int spatial    = 1;
+    for (int i = 2; i < x.dim(); ++i) spatial *= x.size(i);
+    const long long numel = static_cast<long long>(N) * C * spatial;
+
+    auto y = torch::empty_like(x);
+
+    const int block = 256;
+    const int grid  = static_cast<int>((numel + block - 1) / block);
+
+    bn_relu_kernel<<<grid, block>>>(
+        x.data_ptr<float>(),
+        scale.data_ptr<float>(),
+        shift.data_ptr<float>(),
+        y.data_ptr<float>(),
+        C,
+        spatial,
+        numel);
+
+    cudaError_t err = cudaGetLastError();
+    TORCH_CHECK(err == cudaSuccess,
+                "CUDA kernel launch error (bn_relu_kernel): ",
+                cudaGetErrorString(err));
+
+    return y;
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("fused_bn_relu_cuda", &fused_bn_relu_cuda,
+          "Fused BatchNorm (inference) + ReLU (CUDA)");
+}
+"""
+
+cpp_decl = "torch::Tensor fused_bn_relu_cuda(torch::Tensor x, torch::Tensor scale, torch::Tensor shift);"
+
+fused_bn_relu = load_inline(
+    name="fused_bn_relu",
+    cpp_sources=cpp_decl,
+    cuda_sources=cuda_src,
+    functions=["fused_bn_relu_cuda"],
+    verbose=False,
+)
+
+# ---------------------------------------------------------------------------
+# 2. PyTorch wrapper for the fused op
+# ---------------------------------------------------------------------------
+class FusedBNReLU(nn.Module):
+    """
+    Drop-in replacement for `BatchNorm2d + ReLU` that:
+      • Uses native BN + ReLU during training (for correct statistics update)
+      • Uses the custom fused CUDA kernel during evaluation
+    """
+    def __init__(self, num_features: int, eps: float = 1e-5, momentum: float = 0.1):
+        super().__init__()
+        self.eps = eps
+        self.momentum = momentum
+        self.weight = nn.Parameter(torch.ones(num_features))
+        self.bias   = nn.Parameter(torch.zeros(num_features))
+        self.register_buffer("running_mean", torch.zeros(num_features))
+        self.register_buffer("running_var",  torch.ones(num_features))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.training:
+            # Fall back to standard BN + ReLU for statistics accumulation
+            x = F.batch_norm(
+                x,
+                self.running_mean,
+                self.running_var,
+                self.weight,
+                self.bias,
+                True,
+                self.momentum,
+                self.eps,
+            )
+            return F.relu(x, inplace=True)
+        else:
+            # Inference: fuse BN transform with ReLU in a single custom kernel
+            scale = self.weight / torch.sqrt(self.running_var + self.eps)
+            shift = self.bias - self.running_mean * scale
+            return fused_bn_relu.fused_bn_relu_cuda(
+                x.contiguous(),
+                scale.contiguous(),
+                shift.contiguous(),
+            )
+
+# ---------------------------------------------------------------------------
+# 3. Optimised MobileNetV1 – using fused BN+ReLU blocks
+# ---------------------------------------------------------------------------
+class ModelNew(nn.Module):
+    def __init__(self, num_classes=1000, input_channels=3, alpha=1.0):
+        super().__init__()
+
+        def conv_bn(inp, oup, stride):
+            return nn.Sequential(
+                nn.Conv2d(inp, oup, 3, stride, 1, bias=False),
+                FusedBNReLU(oup),
+            )
+
+        def conv_dw(inp, oup, stride):
+            return nn.Sequential(
+                nn.Conv2d(inp, inp, 3, stride, 1, groups=inp, bias=False),
+                FusedBNReLU(inp),
+                nn.Conv2d(inp, oup, 1, 1, 0, bias=False),
+                FusedBNReLU(oup),
+            )
+
+        self.model = nn.Sequential(
+            conv_bn(input_channels, int(32 * alpha), 2),
+            conv_dw(int(32 * alpha),  int(64  * alpha), 1),
+            conv_dw(int(64 * alpha),  int(128 * alpha), 2),
+            conv_dw(int(128 * alpha), int(128 * alpha), 1),
+            conv_dw(int(128 * alpha), int(256 * alpha), 2),
+            conv_dw(int(256 * alpha), int(256 * alpha), 1),
+            conv_dw(int(256 * alpha), int(512 * alpha), 2),
+            conv_dw(int(512 * alpha), int(512 * alpha), 1),
+            conv_dw(int(512 * alpha), int(512 * alpha), 1),
+            conv_dw(int(512 * alpha), int(512 * alpha), 1),
+            conv_dw(int(512 * alpha), int(512 * alpha), 1),
+            conv_dw(int(512 * alpha), int(512 * alpha), 1),
+            conv_dw(int(512 * alpha), int(1024 * alpha), 2),
+            conv_dw(int(1024 * alpha), int(1024 * alpha), 1),
+            nn.AvgPool2d(7),
+        )
+        self.fc = nn.Linear(int(1024 * alpha), num_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.model(x)
+        x = x.view(x.size(0), -1)
+        return self.fc(x)
+
+# ---------------------------------------------------------------------------
+# 4. Helper functions expected by the evaluation harness
+# ---------------------------------------------------------------------------
+batch_size = 5
+input_channels = 3
+height = 112
+width = 112
+num_classes = 100
+alpha = 1.0
+
+def get_inputs():
+    return [torch.rand(batch_size, input_channels, height, width).cuda()]
+
+def get_init_inputs():
+    return [num_classes, input_channels, alpha]

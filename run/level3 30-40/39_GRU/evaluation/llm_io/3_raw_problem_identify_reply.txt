@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Parameter names differ from nn.GRU so weights never copied",
+  "why_it_matters": "Reference weights can’t load into candidate; models use unrelated random parameters, yielding large output divergence.",
+  "minimal_fix_hint": "Rename params to weight_ih_l0 etc. or map state_dict."
+}
+```

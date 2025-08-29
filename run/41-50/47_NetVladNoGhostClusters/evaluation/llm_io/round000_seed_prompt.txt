@@ -1,0 +1,198 @@
+
+You write custom CUDA kernels to replace the pytorch operators in the given architecture 
+to get speedups.You have complete freedom to choose the set of operators you want to replace. You may
+make the decision to replace some operators with custom CUDA kernels and leave others
+unchanged. You may replace multiple operators with custom implementations, consider
+operator fusion opportunities (combining multiple operators into a single kernel, for
+example, combining matmul+relu), or algorithmic changes (such as online softmax). You are
+only limited by your imagination.
+
+Here\’s an example to show you the syntax of inline embedding custom CUDA operators in torch: 
+The example given architecture is:
+‘‘‘
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class Model(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, a, b):
+        return a + b
+
+
+def get_inputs():
+    # randomly generate input tensors based on the model architecture
+    a = torch.randn(1, 128).cuda()
+    b = torch.randn(1, 128).cuda()
+    return [a, b]
+
+
+def get_init_inputs():
+    # randomly generate tensors required for initialization based on the model architecture
+    return []
+‘‘‘
+The example new arch with custom CUDA kernels looks like this:
+‘‘‘
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for element-wise addition
+source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void elementwise_add_kernel(const float* a, const float* b, float* out, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        out[idx] = a[idx] + b[idx];
+    }
+}
+
+torch::Tensor elementwise_add_cuda(torch::Tensor a, torch::Tensor b) {
+    auto size = a.numel();
+    auto out = torch::zeros_like(a);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    elementwise_add_kernel<<<num_blocks, block_size>>>(a.data_ptr<float>(), b.data_ptr<float>(), out.data_ptr<float>(), size);
+
+    return out;
+}
+"""
+
+cpp_src = (
+    "torch::Tensor elementwise_add_cuda(torch::Tensor a, torch::Tensor b);"
+)
+
+# Compile the inline CUDA code for element-wise addition
+elementwise_add = load_inline(
+    name="elementwise_add",
+    cpp_sources=cpp_src,
+    cuda_sources=source,
+    functions=["elementwise_add_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.elementwise_add = elementwise_add
+
+    def forward(self, a, b):
+        return self.elementwise_add.elementwise_add_cuda(a, b)
+‘‘‘
+
+You are given the following architecture:
+```python
+# Copyright 2018 Antoine Miech All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS-IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+Code modified from here
+https://github.com/albanie/collaborative-experts/blob/master/model/net_vlad.py
+"""
+
+
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch as th
+
+
+class Model(nn.Module):
+    def __init__(self, cluster_size, feature_size, ghost_clusters):
+        super(Model, self).__init__()
+
+        self.feature_size = feature_size
+        self.cluster_size = cluster_size
+        self.ghost_clusters = ghost_clusters
+
+        init_sc = (1 / math.sqrt(feature_size))
+        clusters = cluster_size + ghost_clusters
+
+        # The `clusters` weights are the `(w,b)` in the paper
+        self.clusters = nn.Parameter(init_sc * th.randn(feature_size, clusters))
+        self.batch_norm = nn.BatchNorm1d(clusters)
+        # The `clusters2` weights are the visual words `c_k` in the paper
+        self.clusters2 = nn.Parameter(init_sc * th.randn(1, feature_size, cluster_size))
+        self.out_dim = self.cluster_size * feature_size
+
+    def forward(self, x, mask=None):
+        """Aggregates feature maps into a fixed size representation.  In the following
+        notation, B = batch_size, N = num_features, K = num_clusters, D = feature_size.
+
+        Args:
+            x (th.Tensor): B x N x D
+
+        Returns:
+            (th.Tensor): B x DK
+        """
+        max_sample = x.size()[1]
+        x = x.view(-1, self.feature_size)  # B x N x D -> BN x D
+
+        if x.device != self.clusters.device:
+            msg = f"x.device {x.device} != cluster.device {self.clusters.device}"
+            raise ValueError(msg)
+
+        assignment = th.matmul(x, self.clusters)  # (BN x D) x (D x (K+G)) -> BN x (K+G)
+        assignment = self.batch_norm(assignment)
+
+        assignment = F.softmax(assignment, dim=1)  # BN x (K+G) -> BN x (K+G)
+        # remove ghost assigments
+        assignment = assignment[:, :self.cluster_size]
+        assignment = assignment.view(-1, max_sample, self.cluster_size)  # -> B x N x K
+        a_sum = th.sum(assignment, dim=1, keepdim=True)  # B x N x K -> B x 1 x K
+        a = a_sum * self.clusters2
+
+        assignment = assignment.transpose(1, 2)  # B x N x K -> B x K x N
+
+        x = x.view(-1, max_sample, self.feature_size)  # BN x D -> B x N x D
+        vlad = th.matmul(assignment, x)  # (B x K x N) x (B x N x D) -> B x K x D
+        vlad = vlad.transpose(1, 2)  # -> B x D x K
+        vlad = vlad - a
+
+        # L2 intra norm
+        vlad = F.normalize(vlad)
+
+        # flattening + L2 norm
+        vlad = vlad.reshape(-1, self.cluster_size * self.feature_size)  # -> B x DK
+        vlad = F.normalize(vlad)
+        return vlad  # B x DK
+
+batch_size = 1024
+num_features = 50
+num_clusters = 16
+feature_size = 256
+ghost_clusters = 0
+
+def get_inputs():
+  return [torch.rand(batch_size, num_features, feature_size)]
+
+def get_init_inputs():
+  return [num_clusters, feature_size, ghost_clusters]
+```
+Optimize the architecture named Model with custom CUDA operators! Name your optimized
+output architecture ModelNew. Output the new code in codeblocks. Please generate real
+code, NOT pseudocode, make sure the code compiles and is fully functional. Just output
+the new model code, no other text, and NO testing code!

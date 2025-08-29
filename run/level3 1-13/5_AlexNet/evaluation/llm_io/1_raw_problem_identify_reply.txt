@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "fc1 in_features fixed at 256*6*6 instead of 256*2*2",
+  "why_it_matters": "Flattened feature map from 112×112 input is 1024-D, so matmul with 9216-row weight crashes at runtime.",
+  "minimal_fix_hint": "set fc1 in_features=1024 (256*2*2)"
+}
+```

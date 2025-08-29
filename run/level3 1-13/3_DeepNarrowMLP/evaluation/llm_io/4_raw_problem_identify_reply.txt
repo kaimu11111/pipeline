@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Reinitializes independent weights",
+  "why_it_matters": "ModelNew randomly creates its own CUDA-side parameters instead of using the reference Linear weights, causing large output discrepancies.",
+  "minimal_fix_hint": "Share or copy reference layer weights"
+}
+```

@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Stochastic depth (DropPath) omitted",
+  "why_it_matters": "Reference applies DropPath during training; candidate always identity, so forward activations diverge for every block.",
+  "minimal_fix_hint": "Add DropPath module and pass per-block rates."
+}
+```

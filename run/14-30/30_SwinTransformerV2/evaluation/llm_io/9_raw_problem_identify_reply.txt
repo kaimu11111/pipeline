@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "DropPath replaced by identity",
+  "why_it_matters": "Reference applies stochastic depth (rate up to 0.1) during forward; candidate never drops paths, so residual amplitudes and gradients differ significantly.",
+  "minimal_fix_hint": "Implement DropPath with drop_prob parameter like reference."
+}
+```

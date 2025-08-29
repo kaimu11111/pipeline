@@ -1,0 +1,15 @@
+{
+  "avg_speedup": 0.003185303414021259,
+  "accuracy": 1.0,
+  "num_tasks": 1,
+  "tasks": [
+    {
+      "task": "KernelBench/level3test2/40_GRUHidden.py",
+      "best_score": 0.003185303414021259,
+      "best_runnable": true,
+      "task_dir": "/home/wan00559/pipleline/run/20250828_171511_40_GRUHidden/40_GRUHidden",
+      "figure": "/home/wan00559/pipleline/run/20250828_171511_40_GRUHidden/40_GRUHidden/figures/40_GRUHidden_score.png"
+    }
+  ],
+  "timestamp": "2025-08-28 17:21:05"
+}

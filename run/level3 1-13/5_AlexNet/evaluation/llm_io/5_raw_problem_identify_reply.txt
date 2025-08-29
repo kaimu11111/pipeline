@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "fc1 uses 256*2*2 (1024) in_features, reference expects 256*6*6 (9216)",
+  "why_it_matters": "Weight shape mismatch radically changes network behavior and causes runtime errors when comparing outputs with reference model.",
+  "minimal_fix_hint": "set fc1 in_features to 256*6*6"
+}
+```

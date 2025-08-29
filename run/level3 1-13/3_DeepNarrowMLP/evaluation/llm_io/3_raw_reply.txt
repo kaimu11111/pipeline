@@ -1,0 +1,166 @@
+```python
+# 1. Imports
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# 2. source – CUDA code (kernels + host wrappers)
+source = r"""
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+/*
+  The weight matrix coming from Python is passed **transposed** (shape:
+  [in_features, out_features]) so that the CUDA kernel can access it
+  column–contiguously and produce   output = X · Wᵀ (+ bias)   exactly
+  like torch.nn.functional.linear.
+*/
+
+template<bool RELU>
+__global__ void linear_bias_activation_kernel(const float* __restrict__ input,
+                                              const float* __restrict__ weight_T, // (in, out)
+                                              const float* __restrict__ bias,
+                                              float*       __restrict__ output,
+                                              int batch,
+                                              int in_features,
+                                              int out_features) {
+    const int out_idx   = blockIdx.x * blockDim.x + threadIdx.x;  // column  (output feature)
+    const int batch_idx = blockIdx.y * blockDim.y + threadIdx.y;  // row     (batch sample)
+
+    if (out_idx >= out_features || batch_idx >= batch) return;
+
+    const float* x_row = input + batch_idx * in_features;          // X[batch_idx, :]
+
+    float acc = 0.f;
+    #pragma unroll 4
+    for (int k = 0; k < in_features; ++k) {
+        // weight_T[k, out_idx]  – because weight is passed transposed
+        acc += weight_T[k * out_features + out_idx] * x_row[k];
+    }
+
+    acc += bias[out_idx];
+    if (RELU && acc < 0.f) acc = 0.f;
+
+    output[batch_idx * out_features + out_idx] = acc;
+}
+
+// Forward with ReLU -------------------------------------------------
+torch::Tensor linear_bias_relu_forward(torch::Tensor input,
+                                       torch::Tensor weight_T,
+                                       torch::Tensor bias) {
+    TORCH_CHECK(input.is_cuda()   && weight_T.is_cuda() && bias.is_cuda(),
+                "All tensors must be CUDA tensors");
+    TORCH_CHECK(input.scalar_type()   == torch::kFloat32 &&
+                weight_T.scalar_type()== torch::kFloat32 &&
+                bias.scalar_type()    == torch::kFloat32,
+                "Only float32 tensors are supported");
+
+    const int batch        = input.size(0);
+    const int in_features  = input.size(1);
+    const int out_features = bias.size(0);                         // same as weight_T.size(1)
+
+    auto output = torch::empty({batch, out_features}, input.options());
+
+    dim3 block(16, 16);
+    dim3 grid((out_features + block.x - 1) / block.x,
+              (batch       + block.y - 1) / block.y);
+
+    linear_bias_activation_kernel<true><<<grid, block>>>(
+        input.data_ptr<float>(),
+        weight_T.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch,
+        in_features,
+        out_features);
+
+    return output;
+}
+
+// Forward WITHOUT ReLU ---------------------------------------------
+torch::Tensor linear_bias_forward(torch::Tensor input,
+                                  torch::Tensor weight_T,
+                                  torch::Tensor bias) {
+    TORCH_CHECK(input.is_cuda()   && weight_T.is_cuda() && bias.is_cuda(),
+                "All tensors must be CUDA tensors");
+    TORCH_CHECK(input.scalar_type()   == torch::kFloat32 &&
+                weight_T.scalar_type()== torch::kFloat32 &&
+                bias.scalar_type()    == torch::kFloat32,
+                "Only float32 tensors are supported");
+
+    const int batch        = input.size(0);
+    const int in_features  = input.size(1);
+    const int out_features = bias.size(0);
+
+    auto output = torch::empty({batch, out_features}, input.options());
+
+    dim3 block(16, 16);
+    dim3 grid((out_features + block.x - 1) / block.x,
+              (batch       + block.y - 1) / block.y);
+
+    linear_bias_activation_kernel<false><<<grid, block>>>(
+        input.data_ptr<float>(),
+        weight_T.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch,
+        in_features,
+        out_features);
+
+    return output;
+}
+"""
+
+# 3. cpp_src – prototypes for all exposed kernels
+cpp_src = """
+torch::Tensor linear_bias_relu_forward(torch::Tensor input,
+                                       torch::Tensor weight_T,
+                                       torch::Tensor bias);
+torch::Tensor linear_bias_forward(torch::Tensor input,
+                                  torch::Tensor weight_T,
+                                  torch::Tensor bias);
+"""
+
+# 4. Single load_inline call
+fused_linear_cuda = load_inline(
+    name="fused_linear_cuda",
+    cpp_sources=cpp_src,
+    cuda_sources=source,
+    functions=["linear_bias_relu_forward", "linear_bias_forward"],
+    verbose=False,
+)
+
+# 5. class ModelNew – uses fused kernels
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_layer_sizes, output_size):
+        super().__init__()
+        sizes = [input_size] + list(hidden_layer_sizes) + [output_size]
+
+        self.weights = nn.ParameterList()
+        self.biases  = nn.ParameterList()
+
+        for in_f, out_f in zip(sizes[:-1], sizes[1:]):
+            # store weights in standard nn.Linear layout (out_f, in_f)
+            w = nn.Parameter(torch.empty(out_f, in_f, device='cuda'))
+            b = nn.Parameter(torch.empty(out_f,      device='cuda'))
+
+            # Kaiming-uniform initialisation (same as nn.Linear)
+            nn.init.kaiming_uniform_(w, a=(5 ** 0.5))
+            bound = 1.0 / (in_f ** 0.5)
+            nn.init.uniform_(b, -bound, bound)
+
+            self.weights.append(w)
+            self.biases.append(b)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        num_layers = len(self.weights)
+        for idx, (w, b) in enumerate(zip(self.weights, self.biases)):
+            # pass weight **transposed & contiguous** to the CUDA kernel
+            w_T = w.t().contiguous()
+            if idx == num_layers - 1:
+                x = fused_linear_cuda.linear_bias_forward(x.contiguous(), w_T, b)
+            else:
+                x = fused_linear_cuda.linear_bias_relu_forward(x.contiguous(), w_T, b)
+        return x
+```

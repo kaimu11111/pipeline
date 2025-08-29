@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "No clear correctness issue found",
+  "why_it_matters": "CUDA window_partition/reverse algorithms and autograd paths align with the reference implementation.",
+  "minimal_fix_hint": "None needed"
+}
+```

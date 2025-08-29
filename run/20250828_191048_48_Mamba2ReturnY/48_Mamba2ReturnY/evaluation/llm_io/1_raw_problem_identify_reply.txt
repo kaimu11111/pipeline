@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "CUDA segsum is inclusive of j; reference excludes x_j (off-by-one).",
+  "why_it_matters": "Diagonal weights should be 1, but kernel outputs exp(x_i); every L[b,h,c,i,j] factor is wrong, exploding results.",
+  "minimal_fix_hint": "Use prefix[j]-prefix[j-1] with j>0 else 0."
+}
+```

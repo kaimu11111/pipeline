@@ -1,0 +1,205 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# ----------------------------------------------------------------------
+# CUDA kernels + host helpers
+# ----------------------------------------------------------------------
+source = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+/* ---------------- Element-wise residual add ---------------- */
+__global__ void elementwise_add_kernel(const float* a,
+                                       const float* b,
+                                       float* out,
+                                       int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        out[idx] = a[idx] + b[idx];
+    }
+}
+
+torch::Tensor residual_add_cuda(torch::Tensor a, torch::Tensor b) {
+    TORCH_CHECK(a.is_contiguous() && b.is_contiguous(),
+                "Inputs must be contiguous");
+    TORCH_CHECK(a.sizes() == b.sizes(), "Input sizes must match");
+
+    auto out = torch::empty_like(a);
+    const int n        = a.numel();
+    const int threads  = 256;
+    const int blocks   = (n + threads - 1) / threads;
+
+    elementwise_add_kernel<<<blocks, threads>>>(
+        a.data_ptr<float>(),
+        b.data_ptr<float>(),
+        out.data_ptr<float>(),
+        n);
+
+    return out;
+}
+
+/* ---------------- Global average pool (N,C,H,W) → (N,C) ---------------- */
+__global__ void global_avg_pool_kernel(const float* __restrict__ x,
+                                       float* __restrict__ out,
+                                       int N, int C, int HW) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N * C) return;
+
+    const int  n       = idx / C;
+    const int  c       = idx - n * C;
+    const float* ptr   = x + (n * C + c) * HW;
+
+    float sum = 0.f;
+    for (int i = 0; i < HW; ++i)
+        sum += ptr[i];
+
+    out[idx] = sum / HW;
+}
+
+torch::Tensor global_avg_pool_cuda(torch::Tensor x) {
+    TORCH_CHECK(x.dim() == 4, "Expected 4-D tensor (N,C,H,W)");
+    TORCH_CHECK(x.is_contiguous(), "Tensor must be contiguous");
+
+    const int N  = x.size(0);
+    const int C  = x.size(1);
+    const int H  = x.size(2);
+    const int W  = x.size(3);
+    const int HW = H * W;
+
+    auto out     = torch::empty({N, C}, x.options());
+    const int threads = 256;
+    const int blocks  = (N * C + threads - 1) / threads;
+
+    global_avg_pool_kernel<<<blocks, threads>>>(
+        x.data_ptr<float>(),
+        out.data_ptr<float>(),
+        N, C, HW);
+
+    return out;
+}
+"""
+
+# ----------------------------------------------------------------------
+# C++ prototypes exposed to Python
+# ----------------------------------------------------------------------
+cpp_src = """
+torch::Tensor residual_add_cuda(torch::Tensor a, torch::Tensor b);
+torch::Tensor global_avg_pool_cuda(torch::Tensor x);
+"""
+
+# ----------------------------------------------------------------------
+# Build / load the extension
+# ----------------------------------------------------------------------
+custom_ops = load_inline(
+    name="effnet_custom_ops",
+    cpp_sources=cpp_src,
+    cuda_sources=source,
+    functions=["residual_add_cuda", "global_avg_pool_cuda"],
+    verbose=False,
+)
+
+# ----------------------------------------------------------------------
+# Thin Python wrappers around the custom CUDA ops
+# ----------------------------------------------------------------------
+class ResidualAddFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, a, b):
+        return custom_ops.residual_add_cuda(a.contiguous(), b.contiguous())
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        return grad_out, grad_out
+
+
+def residual_add(a, b):
+    return ResidualAddFunction.apply(a, b)
+
+
+class GlobalAvgPool2d(nn.Module):
+    def forward(self, x):
+        return custom_ops.global_avg_pool_cuda(x.contiguous())
+
+
+# ----------------------------------------------------------------------
+# MBConv block using custom residual add
+# ----------------------------------------------------------------------
+class MBConvNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size,
+                 stride, expand_ratio):
+        super().__init__()
+        self.use_residual = (stride == 1 and in_channels == out_channels)
+        hidden_dim        = in_channels * expand_ratio
+
+        if expand_ratio != 1:
+            self.expand_conv = nn.Sequential(
+                nn.Conv2d(in_channels, hidden_dim, 1, bias=False),
+                nn.BatchNorm2d(hidden_dim),
+                nn.ReLU6(inplace=True),
+            )
+
+        self.depthwise_conv = nn.Sequential(
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size, stride,
+                      padding=(kernel_size - 1) // 2,
+                      groups=hidden_dim, bias=False),
+            nn.BatchNorm2d(hidden_dim),
+            nn.ReLU6(inplace=True),
+        )
+
+        self.project_conv = nn.Sequential(
+            nn.Conv2d(hidden_dim, out_channels, 1, bias=False),
+            nn.BatchNorm2d(out_channels),
+        )
+
+    def forward(self, x):
+        identity = x
+
+        if hasattr(self, "expand_conv"):
+            x = self.expand_conv(x)
+
+        x = self.depthwise_conv(x)
+        x = self.project_conv(x)
+
+        if self.use_residual:
+            x = residual_add(x, identity)
+        return x
+
+
+# ----------------------------------------------------------------------
+# EfficientNet-B0 style model that leverages the custom CUDA kernels
+# ----------------------------------------------------------------------
+class ModelNew(nn.Module):
+    def __init__(self, num_classes: int = 1000):
+        super().__init__()
+        self.conv1 = nn.Conv2d(3, 32, 3, stride=2, padding=1, bias=False)
+        self.bn1   = nn.BatchNorm2d(32)
+
+        self.blocks = nn.Sequential(
+            MBConvNew(32, 16, 3, 1, 1),
+            MBConvNew(16, 24, 3, 2, 6),
+            MBConvNew(24, 24, 3, 1, 6),
+            MBConvNew(24, 40, 5, 2, 6),
+            MBConvNew(40, 40, 5, 1, 6),
+            MBConvNew(40, 80, 3, 2, 6),
+            MBConvNew(80, 80, 3, 1, 6),
+            MBConvNew(80, 112, 5, 1, 6),
+            MBConvNew(112, 112, 5, 1, 6),
+            MBConvNew(112, 192, 5, 2, 6),
+            MBConvNew(192, 192, 5, 1, 6),
+            MBConvNew(192, 192, 5, 1, 6),
+            MBConvNew(192, 320, 3, 1, 6),
+        )
+
+        self.conv2 = nn.Conv2d(320, 1280, 1, bias=False)
+        self.bn2   = nn.BatchNorm2d(1280)
+
+        self.gap = GlobalAvgPool2d()
+        self.fc  = nn.Linear(1280, num_classes)
+
+    def forward(self, x):
+        x = nn.functional.relu(self.bn1(self.conv1(x)))
+        x = self.blocks(x)
+        x = nn.functional.relu(self.bn2(self.conv2(x)))
+        x = self.gap(x)
+        x = self.fc(x)
+        return x

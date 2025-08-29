@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "CUDA extension fails to compile; softmax_lastdim_cuda undeclared in main.cpp",
+  "why_it_matters": "Build failure prevents loading the custom kernel, so forward() crashes on GPU, yielding total mismatch versus reference.",
+  "minimal_fix_hint": "Add extern prototype or cpp source so main.cpp sees softmax_lastdim_cuda"
+}
+```

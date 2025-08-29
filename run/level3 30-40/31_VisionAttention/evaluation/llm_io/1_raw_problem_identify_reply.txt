@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Reduction loops use fixed TPB=1024 regardless of blockDim.x",
+  "why_it_matters": "When cols<1024 kernel allocates fewer shared floats but accesses indices up to 1023, leading to OOB writes and wrong outputs.",
+  "minimal_fix_hint": "base reduction on blockDim.x, allocate matching shared memory"
+}
+```

@@ -1,0 +1,6 @@
+{
+  "runnable": false,
+  "phase": "repair",
+  "error_type": "RuntimeError",
+  "message": "Traceback (most recent call last):\n  File \"/home/wan00559/pipleline/utils/compile_and_run.py\", line 516, in compare_and_bench\n    test_model = ModelNew(*init_args, **init_kwargs)\n                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/wan00559/pipleline/run/20250828_162042_batch_first12/29_SwinMLP/code/kernel_20250828_172957.py\", line 398, in __init__\n    layer = BasicLayer(\n            ^^^^^^^^^^^\n  File \"/home/wan00559/pipleline/run/20250828_162042_batch_first12/29_SwinMLP/code/kernel_20250828_172957.py\", line 360, in __init__\n    self.blocks = nn.ModuleList([\n                                ^\n  File \"/home/wan00559/pipleline/run/20250828_162042_batch_first12/29_SwinMLP/code/kernel_20250828_172957.py\", line 361, in <listcomp>\n    ModelNew.SwinMLPBlock(dim, input_resolution,\n    ^^^^^^^^^^^^^^^^^^^^^\nAttributeError: type object 'ModelNew' has no attribute 'SwinMLPBlock'\n"
+}

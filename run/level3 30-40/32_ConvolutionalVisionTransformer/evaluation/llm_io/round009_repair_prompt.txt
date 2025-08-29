@@ -1,0 +1,225 @@
+You are a senior CUDA-extension developer.
+Your job is to **FIX** the compilation or runtime errors in the Python script
+shown below.
+
+OUTPUT RULES (STRICT) ────────────────────────────────────────────────
+1. Inside the block, follow **exactly** this order:
+   1. Imports – `torch`, `torch.nn`, `load_inline`.
+   2. `source` – triple‑quoted CUDA string(s) (kernel + host wrapper).
+   3. `cpp_src` – prototypes for *all* kernels you expose.
+   4. **One** `load_inline` call per kernel group.
+   5. `class ModelNew(nn.Module)` – mirrors original inputs/outputs but calls
+      your CUDA kernels.
+2. **Do NOT include** testing code, `if __name__ == "__main__"`, or extra prose.
+
+────────────────────────────────────────
+ERROR LOG
+────────────────────────────────────────
+Traceback (most recent call last):
+  File "/home/wan00559/pipleline/utils/compile_and_run.py", line 524, in compare_and_bench
+    ref_out,  _ = _run_once(ref_model,  inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/wan00559/pipleline/utils/compile_and_run.py", line 127, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/wan00559/pipleline/KernelBench/level3test2/32_ConvolutionalVisionTransformer.py", line 50, in forward
+    x = self.linear_proj(x)            # (B, embed_dim)
+        ^^^^^^^^^^^^^^^^^^^
+  File "/home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/nn/modules/linear.py", line 125, in forward
+    return F.linear(input, self.weight, self.bias)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: mat1 and mat2 shapes cannot be multiplied (5x1024 and 4096x64)
+
+────────────────────────────────────────
+OLD CODE (read-only)
+────────────────────────────────────────
+# 1. Imports ───────────────────────────────────────────────────────────
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# 2. CUDA source (kernel + host wrapper) ───────────────────────────────
+source = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// ---------------------------------------------------------------------
+// Kernel
+// ---------------------------------------------------------------------
+__global__ void prepend_cls_kernel(
+        const float* __restrict__ inp,   // (B, N, D)
+        const float* __restrict__ cls,   // (D)
+        float*       __restrict__ out,   // (B, N+1, D)
+        const int B,
+        const int N,
+        const int D) {
+
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = B * (N + 1) * D;
+    if (idx >= total) return;
+
+    const int b = idx / ((N + 1) * D);
+    const int n = (idx / D) % (N + 1);
+    const int d = idx % D;
+
+    if (n == 0) {
+        // CLS token
+        out[idx] = cls[d];
+    } else {
+        // Shifted sample embeddings
+        const int inp_idx = b * N * D + (n - 1) * D + d;
+        out[idx] = inp[inp_idx];
+    }
+}
+
+// ---------------------------------------------------------------------
+// Host wrapper
+// ---------------------------------------------------------------------
+torch::Tensor prepend_cls_token_cuda(torch::Tensor inp,
+                                     torch::Tensor cls) {
+    TORCH_CHECK(inp.is_cuda(), "inp must reside on CUDA");
+    TORCH_CHECK(cls.is_cuda(), "cls must reside on CUDA");
+    TORCH_CHECK(inp.dtype() == torch::kFloat32, "inp must be float32");
+    TORCH_CHECK(cls.dtype() == torch::kFloat32, "cls must be float32");
+    TORCH_CHECK(cls.numel() == inp.size(-1), "dimension mismatch (cls)");
+
+    const int B = inp.size(0);
+    const int N = inp.size(1);
+    const int D = inp.size(2);
+
+    auto out = torch::empty({B, N + 1, D}, inp.options());
+
+    constexpr int kBlock = 256;
+    const int grid = (B * (N + 1) * D + kBlock - 1) / kBlock;
+
+    prepend_cls_kernel<<<grid, kBlock>>>(inp.data_ptr<float>(),
+                                         cls.data_ptr<float>(),
+                                         out.data_ptr<float>(),
+                                         B, N, D);
+
+    cudaError_t err = cudaGetLastError();
+    TORCH_CHECK(err == cudaSuccess, cudaGetErrorString(err));
+
+    return out;
+}
+"""
+
+# 3. C++ prototypes ────────────────────────────────────────────────────
+cpp_src = """
+torch::Tensor prepend_cls_token_cuda(torch::Tensor inp,
+                                     torch::Tensor cls);
+"""
+
+# 4. Build / load the extension ────────────────────────────────────────
+prepend_cls_token_ext = load_inline(
+    name         = "prepend_cls_token_ext",
+    cpp_sources  = cpp_src,
+    cuda_sources = source,
+    functions    = ["prepend_cls_token_cuda"],
+    verbose      = False
+)
+
+# 5. Model definition ─────────────────────────────────────────────────
+class ModelNew(nn.Module):
+    """
+    Convolutional Vision Transformer with learnable patch embeddings.
+    A custom CUDA kernel efficiently prepends the shared CLS token.
+    """
+
+    # --------------------------------------------------------------
+    class _PrependCLSTokenFunction(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, inp, cls):
+            out = prepend_cls_token_ext.prepend_cls_token_cuda(
+                inp.contiguous(), cls.contiguous())
+            ctx.save_for_backward(inp)
+            return out
+
+        @staticmethod
+        def backward(ctx, grad_out):
+            (inp,) = ctx.saved_tensors
+            grad_inp = grad_out[:, 1:, :].contiguous()
+            grad_cls = grad_out[:, 0, :].sum(dim=0).contiguous()
+            return grad_inp, grad_cls
+
+    # --------------------------------------------------------------
+    def __init__(self,
+                 num_classes,
+                 embed_dim   = 512,
+                 num_heads   = 8,
+                 num_layers  = 6,
+                 mlp_ratio   = 4.0,
+                 patch_size  = 4,
+                 in_channels = 3):
+        super().__init__()
+
+        self.patch_size = patch_size
+        patch_dim = in_channels * patch_size * patch_size
+
+        # Learnable linear projection for each patch -----------------
+        self.linear_proj = nn.Linear(patch_dim, embed_dim)
+
+        # Transformer encoder stack ----------------------------------
+        self.transformer_layers = nn.ModuleList([
+            nn.TransformerEncoderLayer(
+                d_model         = embed_dim,
+                nhead           = num_heads,
+                dim_feedforward = int(embed_dim * mlp_ratio),
+                dropout         = 0.0,
+                batch_first     = True)
+            for _ in range(num_layers)
+        ])
+
+        # CLS token --------------------------------------------------
+        self.cls_token = nn.Parameter(torch.zeros(embed_dim))
+
+        # Classification head ---------------------------------------
+        self.fc_out = nn.Linear(embed_dim, num_classes)
+
+    # --------------------------------------------------------------
+    def forward(self, x):
+        # x: (B, C, H, W)
+        B, C, H, W = x.shape
+        # Extract non-overlapping patches ---------------------------
+        patches = torch.nn.functional.unfold(
+            x,
+            kernel_size = self.patch_size,
+            stride      = self.patch_size)              # (B, C*P*P, N_patches)
+        patches = patches.transpose(1, 2)               # (B, N_patches, C*P*P)
+
+        # Learnable projection --------------------------------------
+        x = self.linear_proj(patches)                   # (B, N_patches, D)
+
+        # Prepend CLS token via custom CUDA kernel ------------------
+        x = self._PrependCLSTokenFunction.apply(x, self.cls_token)
+
+        # Transformer encoder stack ---------------------------------
+        for layer in self.transformer_layers:
+            x = layer(x)
+
+        # Classification head (use CLS token) -----------------------
+        return self.fc_out(x[:, 0])
+
+────────────────────────────────────────
+Main Critical Problem
+────────────────────────────────────────
+critical_issue: Patch embedding strategy differs; candidate feeds 17 tokens vs. reference 2 tokens
+why_it_matters: Unfold+per-patch linear changes sequence length and semantics, so transformer receives incompatible data and outputs diverge drastically.
+minimal_fix_hint: Use conv2d+flatten then single linear to produce one token
+
+```python
+# <your corrected code>
+```
+# ==========================================================

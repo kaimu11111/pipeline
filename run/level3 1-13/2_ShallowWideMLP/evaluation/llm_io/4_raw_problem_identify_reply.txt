@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "No clear correctness bug found",
+  "why_it_matters": "Kernel math, autograd grads, layer order and shapes all match PyTorch reference; behaviour should align.",
+  "minimal_fix_hint": "None needed"
+}
+```

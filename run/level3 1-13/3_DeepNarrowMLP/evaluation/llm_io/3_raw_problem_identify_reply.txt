@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Kernel missing transpose: computes X·W not X·Wᵀ",
+  "why_it_matters": "nn.Linear uses F.linear(x, W, b) = x·Wᵀ + b. Using un-transposed W changes every dot-product, giving layer-wise incorrect outputs.",
+  "minimal_fix_hint": "index weight as k*out_features+out_idx or swap axes"
+}
+```

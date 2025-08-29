@@ -396,10 +396,6 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                 error_log = _last_n_lines(getattr(current_kernel, "metrics", {}).get("message", "")) if current_kernel else ""
                 
                 
-                ##TODO
-                '''
-                Add judge here for the problem identifing, after get the problem list, give it to the repair_prompt
-                '''
                 problem_system_prompt, problem_prompt = build_correctness_prompts(error_log=error_log,
                                                                                   arch_path = task_path,
                                                                                   cuda_code = current_kernel.code)
@@ -430,8 +426,11 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                     metrics_dir=eval_dir,
                 )
             else:
-                break
                 print("Optimizing start")
+                ##TODO
+                '''
+                Add judge here for the optimization strategy, after get the strategy, give it to the opt_prompt
+                '''
                 history_block = _build_history_block(code_dir, keep_last=10)
                 opt_prompt = build_optimization_prompt(
                     arch_path=current_kernel.code_path,  # type: ignore[union-attr]

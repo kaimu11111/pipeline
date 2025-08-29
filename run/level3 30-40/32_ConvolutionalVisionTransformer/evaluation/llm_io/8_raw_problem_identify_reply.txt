@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Uses global average pooling instead of linear projection",
+  "why_it_matters": "Removes learnable patch embedding; resulting feature vectors diverge from reference model’s outputs and gradients.",
+  "minimal_fix_hint": "Replace pooling with flatten+nn.Linear."
+}
+```

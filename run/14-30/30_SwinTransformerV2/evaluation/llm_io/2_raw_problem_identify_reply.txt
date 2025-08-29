@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "PatchEmbed class missing in CUDA code",
+  "why_it_matters": "ModelNew.__init__ calls PatchEmbed but it’s undefined, raising NameError and preventing any forward pass.",
+  "minimal_fix_hint": "Add PatchEmbed implementation before ModelNew."
+}
+```

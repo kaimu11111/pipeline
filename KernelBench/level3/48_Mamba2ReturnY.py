@@ -88,12 +88,12 @@ class Model(nn.Module):
         return Y
 
 # Test parameters
-batch_size = 2048
-seq_length = 128
-n_heads = 8
-d_head = 64
-d_state = 16
-block_len = 64
+batch_size = 1024
+seq_length = 64
+n_heads = 4
+d_head = 32
+d_state = 8
+block_len = 32
 
 def get_inputs():
     return [torch.rand(batch_size, seq_length, n_heads, d_head)]

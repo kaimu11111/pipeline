@@ -1,0 +1,5 @@
+{
+  "critical_issue": "atomicMax on float bits for max reduction",
+  "why_it_matters": "Signed-int ordering mismaps negatives; wrong max gives incorrect exponentials, so softmax probabilities and attention outputs are wrong.",
+  "minimal_fix_hint": "Do proper float shared reduction, no int cast"
+}

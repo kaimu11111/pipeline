@@ -1,0 +1,176 @@
+# 1. Imports ────────────────────────────────────────────────────────────
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# 2. CUDA source ─────────────────────────────────────────────────────────
+source = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cfloat>
+
+// ──────────────────────────────
+// Fast GELU kernel
+// ──────────────────────────────
+__global__ void fast_gelu_kernel(const float* __restrict__ x,
+                                 float* __restrict__ y,
+                                 int64_t n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+
+    float v      = x[idx];
+    float inner  = 0.7978845608028654f * (v + 0.044715f * v * v * v);
+    y[idx] = 0.5f * v * (1.f + tanhf(inner));
+}
+
+inline torch::Tensor fast_gelu_cuda(torch::Tensor x) {
+    TORCH_CHECK(x.is_cuda(),          "input must be CUDA");
+    TORCH_CHECK(x.scalar_type()==torch::kFloat, "float32 only");
+
+    auto y  = torch::empty_like(x);
+    int64_t n = x.numel();
+    int thr   = 256;
+    int blk   = (n + thr - 1) / thr;
+    fast_gelu_kernel<<<blk, thr>>>(x.data_ptr<float>(),
+                                   y.data_ptr<float>(),
+                                   n);
+    return y;
+}
+
+// ──────────────────────────────
+// Causal-masked softmax kernel
+// ──────────────────────────────
+template<int BS>
+__global__ void causal_softmax_kernel(const float* __restrict__ inp,
+                                      float* __restrict__ out,
+                                      int rows,
+                                      int T) {
+    int row = blockIdx.x;
+    if (row >= rows) return;
+
+    int i        = row % T;               // current timestep
+    const float* in_row  = inp  + row * T;
+    float*       out_row = out  + row * T;
+
+    // 1. Max reduction (valid j ≤ i)
+    __shared__ float s_max[BS];
+    float local_max = -FLT_MAX;
+    for (int j = threadIdx.x; j <= i; j += BS)
+        local_max = fmaxf(local_max, in_row[j]);
+    s_max[threadIdx.x] = local_max;
+    __syncthreads();
+
+    for (int stride = BS >> 1; stride; stride >>= 1) {
+        if (threadIdx.x < stride)
+            s_max[threadIdx.x] = fmaxf(s_max[threadIdx.x],
+                                       s_max[threadIdx.x + stride]);
+        __syncthreads();
+    }
+    float max_val = s_max[0];
+    __syncthreads();
+
+    // 2. Exp & sum reduction
+    __shared__ float s_sum[BS];
+    float local_sum = 0.f;
+    for (int j = threadIdx.x; j <= i; j += BS) {
+        float v = __expf(in_row[j] - max_val);
+        out_row[j] = v;          // stash
+        local_sum += v;
+    }
+    s_sum[threadIdx.x] = local_sum;
+    __syncthreads();
+
+    for (int stride = BS >> 1; stride; stride >>= 1) {
+        if (threadIdx.x < stride)
+            s_sum[threadIdx.x] += s_sum[threadIdx.x + stride];
+        __syncthreads();
+    }
+    float inv_sum = 1.f / s_sum[0];
+    __syncthreads();
+
+    // 3. Write probabilities (mask j > i)
+    for (int j = threadIdx.x; j < T; j += BS)
+        out_row[j] = (j <= i) ? out_row[j] * inv_sum : 0.f;
+}
+
+inline torch::Tensor causal_softmax_cuda(torch::Tensor att) {
+    TORCH_CHECK(att.is_cuda(), "input must be CUDA");
+    TORCH_CHECK(att.scalar_type()==torch::kFloat, "float32 only");
+    TORCH_CHECK(att.dim()==4, "shape (B, nH, T, T) expected");
+
+    auto out = torch::empty_like(att);
+
+    int B   = att.size(0);
+    int H   = att.size(1);
+    int T   = att.size(2);
+    int rows = B * H * T;
+
+    constexpr int BS = 128;
+    causal_softmax_kernel<BS><<<rows, BS>>>(att.data_ptr<float>(),
+                                            out.data_ptr<float>(),
+                                            rows, T);
+    return out;
+}
+"""
+
+# 3. Function prototypes ────────────────────────────────────────────────
+cpp_src = """
+torch::Tensor fast_gelu_cuda(torch::Tensor x);
+torch::Tensor causal_softmax_cuda(torch::Tensor att);
+"""
+
+# 4. Build / load ───────────────────────────────────────────────────────
+kernels = load_inline(
+    name        = "custom_fused_ops_fix",
+    cpp_sources = cpp_src,
+    cuda_sources= source,
+    functions   = ["fast_gelu_cuda", "causal_softmax_cuda"],
+    verbose     = False,
+)
+
+# 5. Python module ──────────────────────────────────────────────────────
+class ModelNew(nn.Module):
+    def __init__(self, n_embd, n_head,
+                 attn_pdrop, resid_pdrop, max_seqlen):
+        super().__init__()
+        self.n_head = n_head
+        self.n_embd = n_embd
+
+        self.ln_1  = nn.LayerNorm(n_embd)
+        self.ln_2  = nn.LayerNorm(n_embd)
+
+        self.c_attn = nn.Linear(n_embd, 3 * n_embd,  bias=True)
+        self.c_proj = nn.Linear(n_embd,     n_embd,  bias=True)
+
+        self.attn_dropout  = nn.Dropout(attn_pdrop)
+        self.resid_dropout = nn.Dropout(resid_pdrop)
+
+        self.mlp_fc   = nn.Linear(n_embd, 4 * n_embd, bias=True)
+        self.mlp_proj = nn.Linear(4 * n_embd, n_embd, bias=True)
+        self.mlp_drop = nn.Dropout(resid_pdrop)
+
+    def forward(self, x):
+        B, T, C = x.size()
+
+        # ── Attention ────────────────────────────────────────────────
+        qkv = self.c_attn(self.ln_1(x))
+        q, k, v = qkv.split(C, dim=2)
+
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+
+        att = torch.matmul(q, k.transpose(-2, -1))
+        att = att * (1.0 / (k.size(-1) ** 0.5))
+        att = kernels.causal_softmax_cuda(att.contiguous())
+        att = self.attn_dropout(att)
+
+        y   = torch.matmul(att, v)
+        y   = y.transpose(1, 2).contiguous().view(B, T, C)
+        y   = self.resid_dropout(self.c_proj(y))
+        x   = x + y
+
+        # ── MLP ──────────────────────────────────────────────────────
+        m = kernels.fast_gelu_cuda(self.mlp_fc(self.ln_2(x)).contiguous())
+        m = self.mlp_drop(self.mlp_proj(m))
+        return x + m

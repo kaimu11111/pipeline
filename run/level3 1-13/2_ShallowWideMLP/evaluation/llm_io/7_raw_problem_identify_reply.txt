@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "`get_init_inputs` references undefined `hidden_layer_sizes`",
+  "why_it_matters": "Raises NameError during model construction, so ModelNew cannot be instantiated; no outputs can match reference.",
+  "minimal_fix_hint": "Define hidden_layer_sizes inside get_init_inputs"
+}
+```

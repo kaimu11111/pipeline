@@ -1,0 +1,218 @@
+You are a senior CUDA-extension developer.
+Your job is to **FIX** the compilation or runtime errors in the Python script
+shown below.
+
+OUTPUT RULES (STRICT) ────────────────────────────────────────────────
+1. Inside the block, follow **exactly** this order:
+   1. Imports – `torch`, `torch.nn`, `load_inline`.
+   2. `source` – triple‑quoted CUDA string(s) (kernel + host wrapper).
+   3. `cpp_src` – prototypes for *all* kernels you expose.
+   4. **One** `load_inline` call per kernel group.
+   5. `class ModelNew(nn.Module)` – mirrors original inputs/outputs but calls
+      your CUDA kernels.
+2. **Do NOT include** testing code, `if __name__ == "__main__"`, or extra prose.
+
+────────────────────────────────────────
+ERROR LOG
+────────────────────────────────────────
+Traceback (most recent call last):
+  File "/home/wan00559/pipleline/utils/compile_and_run.py", line 524, in compare_and_bench
+    ref_out,  _ = _run_once(ref_model,  inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/wan00559/pipleline/utils/compile_and_run.py", line 127, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/wan00559/pipleline/KernelBench/level3test2/32_ConvolutionalVisionTransformer.py", line 50, in forward
+    x = self.linear_proj(x)            # (B, embed_dim)
+        ^^^^^^^^^^^^^^^^^^^
+  File "/home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/nn/modules/linear.py", line 125, in forward
+    return F.linear(input, self.weight, self.bias)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: mat1 and mat2 shapes cannot be multiplied (5x1024 and 4096x64)
+
+────────────────────────────────────────
+OLD CODE (read-only)
+────────────────────────────────────────
+# 1. Imports ───────────────────────────────────────────────────────────
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# 2. CUDA source (kernel + host wrapper) ───────────────────────────────
+source = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// ---------------------------------------------------------------------
+// Kernel
+// ---------------------------------------------------------------------
+__global__ void prepend_cls_kernel(
+        const float* __restrict__  inp,   // (B, D)
+        const float* __restrict__  cls,   // (D)
+        float*       __restrict__  out,   // (B, 2, D)
+        const int B,
+        const int D) {
+
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B * D) return;
+
+    const int b = idx / D;    // batch index
+    const int d = idx % D;    // feature index
+
+    out[b * 2 * D + d]     = cls[d];   // CLS token
+    out[b * 2 * D + D + d] = inp[idx]; // sample embedding
+}
+
+// ---------------------------------------------------------------------
+// Host wrapper
+// ---------------------------------------------------------------------
+torch::Tensor prepend_cls_token_cuda(torch::Tensor inp,
+                                     torch::Tensor cls) {
+    TORCH_CHECK(inp.is_cuda(), "inp must reside on CUDA");
+    TORCH_CHECK(cls.is_cuda(), "cls must reside on CUDA");
+    TORCH_CHECK(inp.dtype() == torch::kFloat32, "inp must be float32");
+    TORCH_CHECK(cls.dtype() == torch::kFloat32, "cls must be float32");
+    TORCH_CHECK(cls.numel() == inp.size(1), "dimension mismatch (cls)");
+
+    const int B = inp.size(0);
+    const int D = inp.size(1);
+
+    auto out = torch::empty({B, 2, D}, inp.options());
+
+    constexpr int kBlock = 256;
+    const int grid = (B * D + kBlock - 1) / kBlock;
+
+    prepend_cls_kernel<<<grid, kBlock>>>(inp.data_ptr<float>(),
+                                         cls.data_ptr<float>(),
+                                         out.data_ptr<float>(),
+                                         B, D);
+
+    cudaError_t err = cudaGetLastError();
+    TORCH_CHECK(err == cudaSuccess, cudaGetErrorString(err));
+
+    return out;
+}
+"""
+
+# 3. C++ prototypes ────────────────────────────────────────────────────
+cpp_src = """
+torch::Tensor prepend_cls_token_cuda(torch::Tensor inp,
+                                     torch::Tensor cls);
+"""
+
+# 4. Build / load the extension ────────────────────────────────────────
+prepend_cls_token_ext = load_inline(
+    name         = "prepend_cls_token_ext",
+    cpp_sources  = cpp_src,
+    cuda_sources = source,
+    functions    = ["prepend_cls_token_cuda"],
+    verbose      = False
+)
+
+# 5. Model definition ─────────────────────────────────────────────────
+class ModelNew(nn.Module):
+    """
+    Convolutional Vision Transformer with a custom CUDA kernel that
+    prepends a CLS token.  The original runtime failure stemmed from
+    LazyLinear binding to a fixed input dimension on its first call,
+    breaking subsequent calls with different image sizes.  The fix
+    below replaces that layer with adaptive global pooling, yielding a
+    stable (B, embed_dim) tensor irrespective of spatial resolution.
+    """
+
+    # --------------------------------------------------------------
+    class _PrependCLSTokenFunction(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, inp, cls):
+            out = prepend_cls_token_ext.prepend_cls_token_cuda(
+                inp.contiguous(),
+                cls.contiguous())
+            ctx.save_for_backward(inp)
+            return out
+
+        @staticmethod
+        def backward(ctx, grad_out):
+            (inp,) = ctx.saved_tensors
+            grad_inp = grad_out[:, 1, :].contiguous()           # w.r.t. sample embeddings
+            grad_cls = grad_out[:, 0, :].sum(dim=0).contiguous()# w.r.t. shared CLS token
+            return grad_inp, grad_cls
+
+    # --------------------------------------------------------------
+    def __init__(self,
+                 num_classes,
+                 embed_dim   = 512,
+                 num_heads   = 8,
+                 num_layers  = 6,
+                 mlp_ratio   = 4.0,
+                 patch_size  = 4,
+                 in_channels = 3):
+        super().__init__()
+
+        self.embed_dim = embed_dim
+
+        # Patch-level CNN projection
+        self.conv = nn.Conv2d(in_channels,
+                              embed_dim,
+                              kernel_size = patch_size,
+                              stride      = patch_size)
+
+        # Global pooling delivers a fixed-size vector regardless of H×W
+        self.pool = nn.AdaptiveAvgPool2d(1)
+
+        # Transformer encoder stack
+        self.transformer_layers = nn.ModuleList([
+            nn.TransformerEncoderLayer(
+                d_model         = embed_dim,
+                nhead           = num_heads,
+                dim_feedforward = int(embed_dim * mlp_ratio),
+                dropout         = 0.0,
+                batch_first     = True)
+            for _ in range(num_layers)
+        ])
+
+        # CLS token
+        self.cls_token = nn.Parameter(torch.zeros(embed_dim))
+
+        # Classification head
+        self.fc_out = nn.Linear(embed_dim, num_classes)
+
+    # --------------------------------------------------------------
+    def forward(self, x):
+        # x: (B, C, H, W)
+        x = self.conv(x)               # (B, D, H', W')
+        x = self.pool(x)               # (B, D, 1, 1)
+        x = x.view(x.size(0), -1)      # (B, D)
+
+        # Prepend CLS token via custom CUDA kernel
+        x = self._PrependCLSTokenFunction.apply(x, self.cls_token)
+
+        # Transformer encoder layers
+        for layer in self.transformer_layers:
+            x = layer(x)
+
+        # Classification head (use CLS token)
+        return self.fc_out(x[:, 0])
+
+────────────────────────────────────────
+Main Critical Problem
+────────────────────────────────────────
+critical_issue: Uses global average pooling instead of linear projection
+why_it_matters: Removes learnable patch embedding; resulting feature vectors diverge from reference model’s outputs and gradients.
+minimal_fix_hint: Replace pooling with flatten+nn.Linear.
+
+```python
+# <your corrected code>
+```
+# ==========================================================

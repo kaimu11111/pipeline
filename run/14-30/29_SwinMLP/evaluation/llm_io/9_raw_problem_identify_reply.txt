@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "PatchEmbed removed img_size equality assert",
+  "why_it_matters": "Candidate happily processes e.g. 112×112 inputs while reference model asserts size 224×224, so outputs diverge or benchmark aborts.",
+  "minimal_fix_hint": "Re-store img_size and assert H==img_size,W==img_size"
+}
+```

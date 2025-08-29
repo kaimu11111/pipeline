@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Wrapper functions undeclared in generated main.cpp",
+  "why_it_matters": "load_inline’s auto-generated main.cpp calls linear_*_forward_cuda without prior declaration, so compilation fails and model can’t run.",
+  "minimal_fix_hint": "Provide forward declarations via cpp_sources or shared header."
+}
+```

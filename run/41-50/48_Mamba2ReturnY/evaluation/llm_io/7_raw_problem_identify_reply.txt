@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Kernel sums start at j+1; should start at j",
+  "why_it_matters": "Segment-sum excludes element j. Reference includes it, so all exponentiated weights differ, giving huge output error (~6e4).",
+  "minimal_fix_hint": "loop from k=j to i, not j+1"
+}
+```

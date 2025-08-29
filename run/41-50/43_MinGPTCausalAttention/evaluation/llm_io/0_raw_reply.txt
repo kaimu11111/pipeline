@@ -1,0 +1,190 @@
+```python
+import math
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+###############################################################################
+#                         CUDA SCALED-MASKED SOFTMAX                           #
+###############################################################################
+
+cuda_src = r"""
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <float.h>
+
+__global__ void scaled_masked_softmax_kernel(const float* __restrict__ input,
+                                             float* __restrict__ output,
+                                             int rows,
+                                             int cols,
+                                             float scale){
+    extern __shared__ float sdata[];
+    int row   = blockIdx.x;          // each block handles one sequence position
+    int tid   = threadIdx.x;
+    int stride = blockDim.x;
+
+    const float* row_ptr = input + row * cols;
+    float* out_ptr       = output + row * cols;
+
+    // --------------------------------------------------------------------- //
+    // 1) compute the row-wise maximum (with causal mask & scaling)          //
+    // --------------------------------------------------------------------- //
+    float local_max = -FLT_MAX;
+    int q_idx = row % cols;          // causal position within sequence
+    for(int col = tid; col < cols; col += stride){
+        float val = row_ptr[col] * scale;
+        if(col > q_idx) val = -1e20f;        // causal mask
+        local_max = fmaxf(local_max, val);
+    }
+    sdata[tid] = local_max;
+    __syncthreads();
+
+    // reduction for maximum
+    for(int offset = blockDim.x >> 1; offset > 0; offset >>= 1){
+        if(tid < offset){
+            sdata[tid] = fmaxf(sdata[tid], sdata[tid + offset]);
+        }
+        __syncthreads();
+    }
+    float max_val = sdata[0];
+    __syncthreads();
+
+    // --------------------------------------------------------------------- //
+    // 2) compute the row-wise sum of exp(x - max)                           //
+    // --------------------------------------------------------------------- //
+    float local_sum = 0.0f;
+    for(int col = tid; col < cols; col += stride){
+        float val = row_ptr[col] * scale;
+        if(col > q_idx) val = -1e20f;
+        local_sum += __expf(val - max_val);
+    }
+    sdata[tid] = local_sum;
+    __syncthreads();
+
+    // reduction for sum
+    for(int offset = blockDim.x >> 1; offset > 0; offset >>= 1){
+        if(tid < offset){
+            sdata[tid] += sdata[tid + offset];
+        }
+        __syncthreads();
+    }
+    float sum_val = sdata[0] + 1e-6f;    // numeric stability
+    __syncthreads();
+
+    // --------------------------------------------------------------------- //
+    // 3) write normalized probabilities                                    //
+    // --------------------------------------------------------------------- //
+    for(int col = tid; col < cols; col += stride){
+        float val = row_ptr[col] * scale;
+        if(col > q_idx) val = -1e20f;
+        float exp_val = __expf(val - max_val);
+        out_ptr[col]  = exp_val / sum_val;
+    }
+}
+
+torch::Tensor scaled_masked_softmax_cuda(torch::Tensor input, float scale){
+    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
+    TORCH_CHECK(input.scalar_type() == at::kFloat, "only float32 is supported");
+
+    // reshape to 2-D [rows, cols] where cols == sequence length (T)
+    const int cols = input.size(-1);
+    const int rows = input.numel() / cols;
+
+    auto output = torch::empty_like(input);
+
+    int threads = 1;
+    while(threads < cols) threads <<= 1;
+    threads = threads > 1024 ? 1024 : threads;
+
+    const size_t smem = threads * sizeof(float);
+
+    scaled_masked_softmax_kernel<<<rows, threads, smem>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        rows,
+        cols,
+        scale
+    );
+    return output;
+}
+"""
+
+cpp_src = "torch::Tensor scaled_masked_softmax_cuda(torch::Tensor input, float scale);"
+
+smsm = load_inline(
+    name="scaled_masked_softmax",
+    cpp_sources=cpp_src,
+    cuda_sources=cuda_src,
+    functions=["scaled_masked_softmax_cuda"],
+    verbose=False,
+)
+
+class _ScaledMaskedSoftmax(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, att, scale):
+        att_contig = att.contiguous()
+        out = smsm.scaled_masked_softmax_cuda(att_contig, float(scale))
+        ctx.scale = scale
+        ctx.save_for_backward(out)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        (out,) = ctx.saved_tensors
+        scale  = ctx.scale
+        # dSoftmax formula: y * (g - (g*y).sum(-1, keepdim=True))
+        tmp = (grad_out * out).sum(-1, keepdim=True)
+        grad_in = scale * out * (grad_out - tmp)
+        return grad_in, None  # no grad for scale
+
+def scaled_masked_softmax(att, scale):
+    return _ScaledMaskedSoftmax.apply(att, scale)
+
+###############################################################################
+#                                 MODEL NEW                                   #
+###############################################################################
+
+class ModelNew(nn.Module):
+    """
+    Optimized version of the vanilla multi-head masked self-attention layer
+    employing a fused CUDA kernel for causal scaled softmax.
+    """
+
+    def __init__(self, n_embd, n_head, attn_pdrop, resid_pdrop, max_seqlen):
+        super().__init__()
+        assert n_embd % n_head == 0
+        self.c_attn = nn.Linear(n_embd, 3 * n_embd, bias=True)
+        self.c_proj = nn.Linear(n_embd, n_embd, bias=True)
+        self.attn_dropout = nn.Dropout(attn_pdrop)
+        self.resid_dropout = nn.Dropout(resid_pdrop)
+
+        self.n_head = n_head
+        self.n_embd = n_embd
+
+    def forward(self, x):
+        B, T, C = x.size()
+
+        # Project to Q, K, V and reshape for multi-head attention
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+
+        # Scaled dot-product attention scores
+        att = torch.matmul(q, k.transpose(-2, -1))  # (B, nh, T, T)
+
+        # Fused causal scaled softmax (includes scaling and masking)
+        scale = 1.0 / math.sqrt(k.size(-1))
+        att = scaled_masked_softmax(att, scale)
+
+        att = self.attn_dropout(att)
+
+        # Aggregate values
+        y = torch.matmul(att, v)                     # (B, nh, T, hs)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+
+        # Final projection
+        y = self.resid_dropout(self.c_proj(y))
+        return y
+```

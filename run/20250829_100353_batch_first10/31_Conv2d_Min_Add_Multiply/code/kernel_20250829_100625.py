@@ -1,0 +1,115 @@
+# <complete ModelNew code>
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# --------------------------------------------------------------------
+# CUDA kernel: optimised fuse min-with-constant + bias add + scalar scale
+# --------------------------------------------------------------------
+cuda_src = r"""
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+// Each block processes one (N, C) pair and iterates over the spatial
+// dimension. This removes expensive div/mod operations that existed in
+// the flat-index kernel and improves cache locality.
+__global__ void fuse_kernel_v2(const float* __restrict__ x,
+                               const float* __restrict__ bias,
+                               float* __restrict__ out,
+                               const int64_t spatial_size,
+                               const int64_t channels,
+                               const float   constant_val,
+                               const float   scale) {
+    const int c = blockIdx.x;   // channel
+    const int n = blockIdx.y;   // batch index
+    if (c >= channels) return;
+
+    const float b = bias[c];
+    const int64_t base = ( (int64_t)n * channels + c ) * spatial_size;
+
+    // Iterate over spatial elements with a grid-stride loop
+    for (int64_t s = threadIdx.x; s < spatial_size; s += blockDim.x) {
+        const int64_t idx = base + s;
+        float v = x[idx];
+        v = v < constant_val ? v : constant_val;  // min with constant
+        v += b;                                   // add bias
+        v *= scale;                               // scale
+        out[idx] = v;
+    }
+}
+
+// Host wrapper
+torch::Tensor fuse_min_bias_scale_cuda(torch::Tensor x,
+                                       torch::Tensor bias,
+                                       float constant_val,
+                                       float scale) {
+    TORCH_CHECK(x.is_cuda(),   "Input tensor must be CUDA");
+    TORCH_CHECK(bias.is_cuda(),"Bias tensor must be CUDA");
+    TORCH_CHECK(x.dtype() == torch::kFloat32,   "Only float32 supported");
+    TORCH_CHECK(bias.dtype() == torch::kFloat32,"Only float32 bias supported");
+
+    x    = x.contiguous();
+    bias = bias.contiguous().view({-1});  // (C)
+
+    auto out = torch::empty_like(x);
+
+    const int64_t N         = x.size(0);
+    const int64_t C         = x.size(1);
+    const int64_t spatial   = x.size(2) * x.size(3);  // H*W
+
+    const dim3 block(256);
+    const dim3 grid(C, N);  // one block per (n, c)
+
+    fuse_kernel_v2<<<grid, block>>>(x.data_ptr<float>(),
+                                    bias.data_ptr<float>(),
+                                    out.data_ptr<float>(),
+                                    spatial,
+                                    C,
+                                    constant_val,
+                                    scale);
+    return out;
+}
+"""
+
+cpp_src = """
+torch::Tensor fuse_min_bias_scale_cuda(torch::Tensor x,
+                                       torch::Tensor bias,
+                                       float constant_val,
+                                       float scale);
+"""
+
+# Compile / load the inline extension (done once at import time)
+_fused_ops = load_inline(name="fuse_min_bias_scale_v2",
+                         cpp_sources=cpp_src,
+                         cuda_sources=cuda_src,
+                         functions=["fuse_min_bias_scale_cuda"],
+                         verbose=False)
+
+# --------------------
+# Optimised torch model
+# --------------------
+class ModelNew(nn.Module):
+    """
+    Optimised model that keeps the convolution in PyTorch but fuses the
+    subsequent min(+constant) + bias add + scalar multiplication into a
+    single custom CUDA kernel.
+    """
+    def __init__(self, in_channels, out_channels,
+                 kernel_size, constant_value,
+                 bias_shape, scaling_factor):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.register_buffer("constant_value", torch.tensor(float(constant_value)))
+        self.register_buffer("scaling_factor", torch.tensor(float(scaling_factor)))
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = _fused_ops.fuse_min_bias_scale_cuda(
+            x,
+            self.bias.view(-1),
+            float(self.constant_value),
+            float(self.scaling_factor)
+        )
+        return x

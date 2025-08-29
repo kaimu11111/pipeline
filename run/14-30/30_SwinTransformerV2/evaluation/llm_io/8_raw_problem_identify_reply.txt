@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "clamp max uses CPU tensor in WindowAttention",
+  "why_it_matters": "torch.clamp(self.logit_scale, max=torch.log(torch.tensor(100.))) fails when logit_scale is on GPU, breaking forward pass.",
+  "minimal_fix_hint": "use 4.605 or tensor.to(x.device)"
+}
+```

@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Kernel’s segment sum includes A[j] term",
+  "why_it_matters": "Should sum (j+1…i); current [j…i] makes diagonal exp(x[i]) not 1, amplifying errors through einsums.",
+  "minimal_fix_hint": "start loop at k=j+1 or subtract A[j]"
+}
+```

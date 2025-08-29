@@ -1,0 +1,240 @@
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# ----------------------------------------------------------------------
+# Custom CUDA kernel: concatenate 4 tensors along the channel dimension
+# ----------------------------------------------------------------------
+cuda_src = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+template <typename scalar_t>
+__global__ void concat_channels4_kernel(
+        const scalar_t* __restrict__ in1,
+        const scalar_t* __restrict__ in2,
+        const scalar_t* __restrict__ in3,
+        const scalar_t* __restrict__ in4,
+        scalar_t* __restrict__ out,
+        int N,
+        int C1,
+        int C2,
+        int C3,
+        int C4,
+        int H,
+        int W) {
+
+    const int total_channels = C1 + C2 + C3 + C4;
+    const int HW             = H * W;
+    const int total_elems    = N * total_channels * HW;
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_elems) return;
+
+    int hw_idx = idx % HW;
+    int tmp    = idx / HW;
+    int c      = tmp % total_channels;
+    int n      = tmp / total_channels;
+
+    if (c < C1) {
+        int offset = ((n * C1 + c) * HW) + hw_idx;
+        out[idx]   = in1[offset];
+    } else if (c < C1 + C2) {
+        int c2     = c - C1;
+        int offset = ((n * C2 + c2) * HW) + hw_idx;
+        out[idx]   = in2[offset];
+    } else if (c < C1 + C2 + C3) {
+        int c3     = c - (C1 + C2);
+        int offset = ((n * C3 + c3) * HW) + hw_idx;
+        out[idx]   = in3[offset];
+    } else {
+        int c4     = c - (C1 + C2 + C3);
+        int offset = ((n * C4 + c4) * HW) + hw_idx;
+        out[idx]   = in4[offset];
+    }
+}
+
+torch::Tensor concat_channels4_cuda(torch::Tensor in1,
+                                    torch::Tensor in2,
+                                    torch::Tensor in3,
+                                    torch::Tensor in4) {
+    TORCH_CHECK(in1.is_cuda(), "Inputs must be CUDA tensors");
+    TORCH_CHECK(in1.dtype() == in2.dtype() &&
+                in1.dtype() == in3.dtype() &&
+                in1.dtype() == in4.dtype(),
+                "All inputs must have the same dtype");
+    TORCH_CHECK(in1.dim() == 4, "Inputs must be 4-D (NCHW)");
+
+    const int N = in1.size(0);
+    const int H = in1.size(2);
+    const int W = in1.size(3);
+
+    TORCH_CHECK(in2.size(0) == N && in3.size(0) == N && in4.size(0) == N, "Batch size mismatch");
+    TORCH_CHECK(in2.size(2) == H && in3.size(2) == H && in4.size(2) == H, "Height mismatch");
+    TORCH_CHECK(in2.size(3) == W && in3.size(3) == W && in4.size(3) == W, "Width mismatch");
+
+    const int C1 = in1.size(1);
+    const int C2 = in2.size(1);
+    const int C3 = in3.size(1);
+    const int C4 = in4.size(1);
+
+    auto out = torch::empty({N, C1 + C2 + C3 + C4, H, W}, in1.options());
+
+    const int threads = 256;
+    const int total_elems = N * (C1 + C2 + C3 + C4) * H * W;
+    const int blocks = (total_elems + threads - 1) / threads;
+
+    AT_DISPATCH_FLOATING_TYPES(in1.scalar_type(), "concat_channels4_cuda", ([&] {
+        concat_channels4_kernel<scalar_t><<<blocks, threads>>>(
+            in1.data_ptr<scalar_t>(),
+            in2.data_ptr<scalar_t>(),
+            in3.data_ptr<scalar_t>(),
+            in4.data_ptr<scalar_t>(),
+            out.data_ptr<scalar_t>(),
+            N, C1, C2, C3, C4, H, W);
+    }));
+
+    return out;
+}
+"""
+
+cpp_src = r"""
+torch::Tensor concat_channels4_cuda(torch::Tensor in1,
+                                    torch::Tensor in2,
+                                    torch::Tensor in3,
+                                    torch::Tensor in4);
+"""
+
+# Build the extension (done lazily at first call)
+concat_mod = load_inline(
+    name="concat_channels4_ext",
+    cpp_sources=cpp_src,
+    cuda_sources=cuda_src,
+    functions=["concat_channels4_cuda"],
+    verbose=False,
+)
+
+# ----------------------------------------------------------------------
+#  Inception module using the custom concat kernel
+# ----------------------------------------------------------------------
+class InceptionModuleNew(nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        out_1x1,
+        reduce_3x3,
+        out_3x3,
+        reduce_5x5,
+        out_5x5,
+        pool_proj,
+    ):
+        super().__init__()
+
+        # 1x1 convolution branch
+        self.branch1x1 = nn.Conv2d(in_channels, out_1x1, kernel_size=1)
+
+        # 3x3 convolution branch
+        self.branch3x3 = nn.Sequential(
+            nn.Conv2d(in_channels, reduce_3x3, kernel_size=1),
+            nn.Conv2d(reduce_3x3, out_3x3, kernel_size=3, padding=1),
+        )
+
+        # 5x5 convolution branch
+        self.branch5x5 = nn.Sequential(
+            nn.Conv2d(in_channels, reduce_5x5, kernel_size=1),
+            nn.Conv2d(reduce_5x5, out_5x5, kernel_size=5, padding=2),
+        )
+
+        # Max-pooling branch
+        self.branch_pool = nn.Sequential(
+            nn.MaxPool2d(kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(in_channels, pool_proj, kernel_size=1),
+        )
+
+    def forward(self, x):
+        b1 = self.branch1x1(x)
+        b2 = self.branch3x3(x)
+        b3 = self.branch5x5(x)
+        b4 = self.branch_pool(x)
+
+        # Ensure tensors are contiguous for raw pointer access
+        b1, b2, b3, b4 = [t.contiguous() for t in (b1, b2, b3, b4)]
+        return concat_mod.concat_channels4_cuda(b1, b2, b3, b4)
+
+
+# ----------------------------------------------------------------------
+#  Full Model with custom Inception modules
+# ----------------------------------------------------------------------
+class ModelNew(nn.Module):
+    def __init__(self, num_classes: int = 1000):
+        super().__init__()
+
+        self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3)
+        self.maxpool1 = nn.MaxPool2d(3, stride=2, padding=1)
+        self.conv2 = nn.Conv2d(64, 64, kernel_size=1)
+        self.conv3 = nn.Conv2d(64, 192, kernel_size=3, padding=1)
+        self.maxpool2 = nn.MaxPool2d(3, stride=2, padding=1)
+
+        self.inception3a = InceptionModuleNew(192, 64, 96, 128, 16, 32, 32)
+        self.inception3b = InceptionModuleNew(256, 128, 128, 192, 32, 96, 64)
+        self.maxpool3 = nn.MaxPool2d(3, stride=2, padding=1)
+
+        self.inception4a = InceptionModuleNew(480, 192, 96, 208, 16, 48, 64)
+        self.inception4b = InceptionModuleNew(512, 160, 112, 224, 24, 64, 64)
+        self.inception4c = InceptionModuleNew(512, 128, 128, 256, 24, 64, 64)
+        self.inception4d = InceptionModuleNew(512, 112, 144, 288, 32, 64, 64)
+        self.inception4e = InceptionModuleNew(528, 256, 160, 320, 32, 128, 128)
+        self.maxpool4 = nn.MaxPool2d(3, stride=2, padding=1)
+
+        self.inception5a = InceptionModuleNew(832, 256, 160, 320, 32, 128, 128)
+        self.inception5b = InceptionModuleNew(832, 384, 192, 384, 48, 128, 128)
+
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.dropout = nn.Dropout(0.0)
+        self.fc = nn.Linear(1024, num_classes)
+
+    def forward(self, x):
+        x = self.maxpool1(F.relu(self.conv1(x)))
+        x = F.relu(self.conv2(x))
+        x = self.maxpool2(F.relu(self.conv3(x)))
+
+        x = self.inception3a(x)
+        x = self.inception3b(x)
+        x = self.maxpool3(x)
+
+        x = self.inception4a(x)
+        x = self.inception4b(x)
+        x = self.inception4c(x)
+        x = self.inception4d(x)
+        x = self.inception4e(x)
+        x = self.maxpool4(x)
+
+        x = self.inception5a(x)
+        x = self.inception5b(x)
+
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.dropout(x)
+        x = self.fc(x)
+        return x
+
+
+# ----------------------------------------------------------------------
+# Helpers for integration with evaluation harness
+# ----------------------------------------------------------------------
+batch_size = 5
+input_channels = 3
+height = 112
+width = 112
+num_classes = 100
+
+
+def get_inputs():
+    return [torch.rand(batch_size, input_channels, height, width).cuda()]
+
+
+def get_init_inputs():
+    return [num_classes]
+```

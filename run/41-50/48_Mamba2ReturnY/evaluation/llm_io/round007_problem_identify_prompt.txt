@@ -1,0 +1,280 @@
+You are given:
+
+ERROR_LOG:
+Traceback (most recent call last):
+  File "/home/wan00559/pipleline/utils/compile_and_run.py", line 541, in compare_and_bench
+    raise ValueError(
+ValueError: Outputs are not close (atol=0.001, rtol=0.001). max_abs_err=6.554e+04, mean_abs_err=1.641e-01
+
+PyTorch reference (ground truth):
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from einops import rearrange
+
+class Model(nn.Module):
+    def __init__(self, batch_size, seq_length, n_heads, d_head, d_state, block_len=64):
+        """
+        Mamba Structured State Space model implementation for benchmarking.
+        
+        :param batch_size: Size of the batch
+        :param seq_length: Length of the input sequence
+        :param n_heads: Number of attention heads
+        :param d_head: Dimension of each head
+        :param d_state: Dimension of the state space
+        :param block_len: Length of each block for chunked computation
+        """
+        super(Model, self).__init__()
+        
+        assert seq_length % block_len == 0, "Sequence length must be divisible by block length"
+        
+        self.batch_size = batch_size
+        self.seq_length = seq_length
+        self.n_heads = n_heads
+        self.d_head = d_head
+        self.d_state = d_state
+        self.block_len = block_len
+        
+        # Initialize parameters
+        self.A = nn.Parameter(torch.randn(batch_size, seq_length, n_heads))
+        self.B = nn.Parameter(torch.randn(batch_size, seq_length, n_heads, d_state))
+        self.C = nn.Parameter(torch.randn(batch_size, seq_length, n_heads, d_state))
+        
+    def segsum(self, x):
+        """Naive segment sum calculation."""
+        T = x.size(-1)
+        x_cumsum = torch.cumsum(x, dim=-1)
+        x_segsum = x_cumsum[..., :, None] - x_cumsum[..., None, :]
+        mask = torch.tril(torch.ones(T, T, device=x.device, dtype=bool), diagonal=0)
+        x_segsum = x_segsum.masked_fill(~mask, -torch.inf)
+        return x_segsum
+    
+    def forward(self, X, initial_states=None):
+        """
+        Forward pass implementing the SSD operation.
+        
+        :param X: Input tensor of shape (batch, length, n_heads, d_head)
+        :param initial_states: Optional initial states
+        :return: Output tensor Y and final state
+        """
+        # Rearrange into blocks/chunks
+        X_blocks, A_blocks, B_blocks, C_blocks = [
+            rearrange(x, "b (c l) ... -> b c l ...", l=self.block_len)
+            for x in (X, self.A, self.B, self.C)
+        ]
+        
+        A_blocks = rearrange(A_blocks, "b c l h -> b h c l")
+        A_cumsum = torch.cumsum(A_blocks, dim=-1)
+        
+        # 1. Compute diagonal block outputs
+        L = torch.exp(self.segsum(A_blocks))
+        Y_diag = torch.einsum("bclhn,bcshn,bhcls,bcshp->bclhp", 
+                             C_blocks, B_blocks, L, X_blocks)
+        
+        # 2. Compute intra-chunk states
+        decay_states = torch.exp((A_cumsum[:, :, :, -1:] - A_cumsum))
+        states = torch.einsum("bclhn,bhcl,bclhp->bchpn", 
+                            B_blocks, decay_states, X_blocks)
+        
+        # 3. Compute inter-chunk recurrence
+        if initial_states is None:
+            initial_states = torch.zeros_like(states[:, :1])
+        states = torch.cat([initial_states, states], dim=1)
+        
+        decay_chunk = torch.exp(self.segsum(F.pad(A_cumsum[:, :, :, -1], (1, 0))))
+        new_states = torch.einsum("bhzc,bchpn->bzhpn", decay_chunk, states)
+        states = new_states[:, :-1]
+        
+        # 4. Compute state-to-output conversion
+        state_decay_out = torch.exp(A_cumsum)
+        Y_off = torch.einsum('bclhn,bchpn,bhcl->bclhp', 
+                           C_blocks, states, state_decay_out)
+        
+        # Combine diagonal and off-diagonal terms
+        Y = rearrange(Y_diag + Y_off, "b c l h p -> b (c l) h p")
+        
+        
+        return Y
+
+# Test parameters
+batch_size = 1024
+seq_length = 64
+n_heads = 4
+d_head = 32
+d_state = 8
+block_len = 32
+
+def get_inputs():
+    return [torch.rand(batch_size, seq_length, n_heads, d_head)]
+
+def get_init_inputs():
+    return [batch_size, seq_length, n_heads, d_head, d_state, block_len]
+
+CUDA candidate (to audit):
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+source = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <math_constants.h>
+
+// Exclusive segment-sum with log-domain upper-triangular masking.
+// For each sequence A[0..L-1] (per (B,H,C) triple) produce
+//   S_{i,j} = Σ_{k=j+1}^{i} A_k     (0 ≤ j ≤ i < L)
+// Upper-triangular (j>i) is set to -∞ so that exp(S) becomes 0.
+__global__ void segsum_exp_kernel(const float* __restrict__ A,
+                                  float*       __restrict__ L,
+                                  const int                Llen)
+{
+    const int bhc       = blockIdx.x;                        // packed (B,H,C)
+    const float* A_ptr  = A + (size_t)bhc * Llen;            // sequence start
+    float*       L_ptr  = L + (size_t)bhc * Llen * Llen;     // out-matrix start
+
+    const int tid         = threadIdx.x;
+    const int n_threads   = blockDim.x;
+    const int total_elems = Llen * Llen;
+
+    for (int idx = tid; idx < total_elems; idx += n_threads)
+    {
+        const int i = idx / Llen;          // row  (target position)
+        const int j = idx - i * Llen;      // col  (source position)
+
+        float log_sum;
+        if (j <= i)                        // lower-triangular incl. diagonal
+        {
+            float acc = 0.f;
+            #pragma unroll
+            for (int k = j + 1; k <= i; ++k)   // Σ_{k=j+1}^{i}
+                acc += A_ptr[k];
+            log_sum = acc;                     // log-weight
+        }
+        else
+        {
+            log_sum = -CUDART_INF_F;           // mask with −∞  (exp⇒0)
+        }
+        L_ptr[idx] = __expf(log_sum);          // write exp(sum)
+    }
+}
+
+torch::Tensor segsum_exp_cuda(torch::Tensor A)
+{
+    TORCH_CHECK(A.dim() == 4, "Expected A of shape (B,H,C,L)");
+    TORCH_CHECK(A.is_cuda(), "Tensor must reside on CUDA device");
+    TORCH_CHECK(A.scalar_type() == at::kFloat, "Only float32 supported");
+
+    auto A_contig = A.contiguous();
+    const int B    = A_contig.size(0);
+    const int H    = A_contig.size(1);
+    const int C    = A_contig.size(2);
+    const int Llen = A_contig.size(3);
+
+    auto opts = torch::TensorOptions().dtype(A.dtype()).device(A.device());
+    auto out  = torch::empty({B, H, C, Llen, Llen}, opts);
+
+    const int grid  = B * H * C;
+    const int block = 256;
+
+    segsum_exp_kernel<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+        A_contig.data_ptr<float>(),
+        out.data_ptr<float>(),
+        Llen);
+
+    return out;
+}
+"""
+
+cpp_src = "torch::Tensor segsum_exp_cuda(torch::Tensor A);"
+
+segsum_exp = load_inline(
+    name         = "segsum_exp",
+    cpp_sources  = cpp_src,
+    cuda_sources = source,
+    functions    = ["segsum_exp_cuda"],
+    verbose      = False,
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, batch_size, seq_length, n_heads, d_head, d_state, block_len=64):
+        super().__init__()
+        assert seq_length % block_len == 0, "seq_len must be divisible by block_len"
+
+        self.batch_size = batch_size
+        self.seq_length = seq_length
+        self.n_heads    = n_heads
+        self.d_head     = d_head
+        self.d_state    = d_state
+        self.block_len  = block_len
+
+        # parameters copied from baseline
+        self.A = nn.Parameter(torch.randn(batch_size, seq_length, n_heads))
+        self.B = nn.Parameter(torch.randn(batch_size, seq_length, n_heads, d_state))
+        self.C = nn.Parameter(torch.randn(batch_size, seq_length, n_heads, d_state))
+
+        self._segsum_exp = segsum_exp.segsum_exp_cuda
+
+    # Reference exclusive CPU implementation (unchanged)
+    @staticmethod
+    def _segsum_ref(x: torch.Tensor) -> torch.Tensor:
+        T      = x.size(-1)
+        cumsum = torch.cumsum(x, dim=-1)
+        segsum = cumsum[..., :, None] - cumsum[..., None, :]
+        mask   = torch.tril(torch.ones(T, T, dtype=torch.bool, device=x.device))
+        segsum = segsum.masked_fill(~mask, float("-inf"))
+        return segsum
+
+    # reshape helpers
+    def _blockify(self, t: torch.Tensor) -> torch.Tensor:
+        b, s = t.shape[:2]
+        c    = s // self.block_len
+        return t.view(b, c, self.block_len, *t.shape[2:])
+
+    def forward(self, X, initial_states=None):
+        # ── blockify ──────────────────────────────────────────────
+        X_blk = self._blockify(X)
+        A_blk = self._blockify(self.A)
+        B_blk = self._blockify(self.B)
+        C_blk = self._blockify(self.C)
+
+        # (b,h,c,l) for kernel
+        A_blk_k = A_blk.permute(0, 3, 1, 2)                    # (B,H,C,L)
+
+        # ── 1. diagonal block via CUDA ───────────────────────────
+        L     = self._segsum_exp(A_blk_k)                      # (B,H,C,L,L)
+        Y_dig = torch.einsum("bclhn,bcshn,bhcls,bcshp->bclhp",
+                             C_blk, B_blk, L, X_blk)
+
+        # ── 2. intra-chunk state update ─────────────────────────
+        A_cumsum    = torch.cumsum(A_blk_k, dim=-1)
+        decay_state = torch.exp(A_cumsum[..., :, -1:] - A_cumsum)
+        states      = torch.einsum("bclhn,bhcl,bclhp->bchpn",
+                                   B_blk, decay_state, X_blk)
+
+        # ── 3. inter-chunk recurrence ───────────────────────────
+        if initial_states is None:
+            initial_states = torch.zeros_like(states[:, :1])
+        states = torch.cat([initial_states, states], dim=1)
+
+        decay_chunk = torch.exp(self._segsum_ref(
+            nn.functional.pad(A_cumsum[..., -1], (1, 0))
+        ))
+        new_states  = torch.einsum("bhzc,bchpn->bzhpn", decay_chunk, states)
+        states      = new_states[:, :-1]
+
+        # ── 4. state-to-output conversion ───────────────────────
+        state_decay = torch.exp(A_cumsum)
+        Y_off       = torch.einsum("bclhn,bchpn,bhcl->bclhp",
+                                   C_blk, states, state_decay)
+
+        # ── restore original shape ──────────────────────────────
+        Y_tot = Y_dig + Y_off
+        b, c, l, h, p = Y_tot.shape
+        return Y_tot.reshape(b, c * l, h, p)
+
+
+Follow the Rules and produce the JSON exactly in the specified format.

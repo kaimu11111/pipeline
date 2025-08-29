@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "No issue detected",
+  "why_it_matters": "CUDA logic matches reference; observed error stems from reference script.",
+  "minimal_fix_hint": "None required."
+}
+```

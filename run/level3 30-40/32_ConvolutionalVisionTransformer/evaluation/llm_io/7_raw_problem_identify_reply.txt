@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "linear_proj uses LazyLinear, not fixed  embed_dim*num_patches",
+  "why_it_matters": "Infers in_features from first input (1024) instead of reference’s 4096, giving different weight shapes and outputs.",
+  "minimal_fix_hint": "Use nn.Linear(embed_dim*((image//patch)**2), embed_dim)"
+}
+```

@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "CPU tensors sent to CUDA kernel",
+  "why_it_matters": "Kernel runs on GPU but receives CPU memory, causing runtime failure or garbage results unlike all-CPU reference GRU.",
+  "minimal_fix_hint": "Ensure x, h, weights are .cuda() before kernel call"
+}
+```

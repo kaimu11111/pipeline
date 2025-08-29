@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "AdaptiveAvgPool2d(1) replaces fixed AvgPool2d(7)",
+  "why_it_matters": "Reference pools with kernel=7 producing 1×1 only when feature map is 7×7; candidate always pools, changing outputs for other input sizes.",
+  "minimal_fix_hint": "Use nn.AvgPool2d(7) instead"
+}
+```

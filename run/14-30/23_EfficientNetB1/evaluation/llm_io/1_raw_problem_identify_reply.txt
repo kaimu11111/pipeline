@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Duplicate PYBIND11_MODULE definition in cpp and cu",
+  "why_it_matters": "Linker emits multiple-symbol error, build aborts; custom ReLU6 never loads, so model cannot execute at all.",
+  "minimal_fix_hint": "Keep PYBIND11_MODULE in one file"
+}
+```

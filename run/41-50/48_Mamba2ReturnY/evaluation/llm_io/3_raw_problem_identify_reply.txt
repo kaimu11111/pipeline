@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Kernel computes inclusive sum; reference expects exclusive (diag should be 0).",
+  "why_it_matters": "Diagonal elements become exp(A_i) instead of 1, corrupting all subsequent tensor contractions and exploding output values.",
+  "minimal_fix_hint": "Start summation at k=j+1 or post-zero diag before exp."
+}
+```

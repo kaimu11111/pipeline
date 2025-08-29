@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Duplicate module init symbol in CUDA source",
+  "why_it_matters": "PYBIND11_MODULE block duplicates load_inline’s auto-generated init, link fails, extension never builds, model unusable.",
+  "minimal_fix_hint": "Delete PYBIND11_MODULE from cuda_src"
+}
+```

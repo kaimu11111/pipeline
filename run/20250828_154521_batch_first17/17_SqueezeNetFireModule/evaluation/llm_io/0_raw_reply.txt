@@ -1,0 +1,237 @@
+```python
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# ------------------------------------------------------------------
+# CUDA kernels (conv1x1 + ReLU) and (channel concat)
+# ------------------------------------------------------------------
+cuda_source = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// ------------------------------------------------------------------
+// 1×1 Convolution + ReLU (NCHW, float32, contiguous)
+// ------------------------------------------------------------------
+__global__ void conv1x1_relu_kernel(
+        const float* __restrict__ input,
+        const float* __restrict__ weight,
+        const float* __restrict__ bias,
+        float* __restrict__ output,
+        const int N,
+        const int C_in,
+        const int H,
+        const int W,
+        const int C_out)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = N * C_out * H * W;
+    if (idx >= total) return;
+
+    const int w      =  idx % W;
+    const int h      = (idx / W) % H;
+    const int c_out  = (idx / (W * H)) % C_out;
+    const int n      =  idx / (C_out * H * W);
+
+    float val = bias[c_out];
+
+    const int base_in = ((n * C_in) * H + h) * W + w;          // channel 0 for this pixel
+    const float* in_ptr = input + base_in;                      // stride over channels by H*W
+    const float* w_ptr  = weight + c_out * C_in;
+
+    for (int c_in = 0; c_in < C_in; ++c_in)
+        val += in_ptr[c_in * H * W] * w_ptr[c_in];
+
+    // ReLU
+    if (val < 0.f) val = 0.f;
+    output[idx] = val;
+}
+
+torch::Tensor conv1x1_relu_cuda(torch::Tensor input,
+                                torch::Tensor weight,
+                                torch::Tensor bias)
+{
+    TORCH_CHECK(input.is_cuda() && weight.is_cuda() && bias.is_cuda(),
+                "All tensors must be on CUDA");
+    TORCH_CHECK(input.is_contiguous() && weight.is_contiguous() && bias.is_contiguous(),
+                "All tensors must be contiguous");
+    TORCH_CHECK(input.dtype() == torch::kFloat32 &&
+                weight.dtype() == torch::kFloat32 &&
+                bias.dtype()   == torch::kFloat32,
+                "Only float32 tensors are supported");
+
+    const int N      = input.size(0);
+    const int C_in   = input.size(1);
+    const int H      = input.size(2);
+    const int W      = input.size(3);
+    const int C_out  = weight.size(0);
+
+    auto output = torch::empty({N, C_out, H, W}, input.options());
+
+    const int threads = 256;
+    const int total   = N * C_out * H * W;
+    const int blocks  = (total + threads - 1) / threads;
+
+    conv1x1_relu_kernel<<<blocks, threads>>>(
+        input.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        output.data_ptr<float>(),
+        N, C_in, H, W, C_out
+    );
+
+    return output;
+}
+
+// ------------------------------------------------------------------
+// Channel concatenation (NCHW, float32, contiguous) :  [C1] || [C2]
+// ------------------------------------------------------------------
+__global__ void channel_concat_kernel(
+        const float* __restrict__ A,
+        const float* __restrict__ B,
+        float* __restrict__ out,
+        const int N,
+        const int C1,
+        const int C2,
+        const int H,
+        const int W)
+{
+    const int idx   = blockIdx.x * blockDim.x + threadIdx.x;
+    const int Cout  = C1 + C2;
+    const int total = N * Cout * H * W;
+    if (idx >= total) return;
+
+    const int w = idx % W;
+    const int h = (idx / W) % H;
+    const int c = (idx / (W * H)) % Cout;
+    const int n = idx / (Cout * H * W);
+
+    int out_offset = ((n * Cout + c) * H + h) * W + w;
+
+    if (c < C1) {
+        int a_offset = ((n * C1 + c) * H + h) * W + w;
+        out[out_offset] = A[a_offset];
+    } else {
+        const int cb   = c - C1;
+        int b_offset = ((n * C2 + cb) * H + h) * W + w;
+        out[out_offset] = B[b_offset];
+    }
+}
+
+torch::Tensor channel_concat_cuda(torch::Tensor A, torch::Tensor B)
+{
+    TORCH_CHECK(A.is_cuda() && B.is_cuda(), "Inputs must be CUDA tensors");
+    TORCH_CHECK(A.dtype() == torch::kFloat32 && B.dtype() == torch::kFloat32,
+                "Only float32 supported");
+    TORCH_CHECK(A.is_contiguous() && B.is_contiguous(),
+                "Inputs must be contiguous");
+    TORCH_CHECK(A.size(0) == B.size(0) &&
+                A.size(2) == B.size(2) &&
+                A.size(3) == B.size(3),
+                "Input shapes must match except channels");
+
+    const int N  = A.size(0);
+    const int C1 = A.size(1);
+    const int H  = A.size(2);
+    const int W  = A.size(3);
+    const int C2 = B.size(1);
+
+    auto out = torch::empty({N, C1 + C2, H, W}, A.options());
+
+    const int threads = 256;
+    const int total   = N * (C1 + C2) * H * W;
+    const int blocks  = (total + threads - 1) / threads;
+
+    channel_concat_kernel<<<blocks, threads>>>(
+        A.data_ptr<float>(),
+        B.data_ptr<float>(),
+        out.data_ptr<float>(),
+        N, C1, C2, H, W
+    );
+
+    return out;
+}
+"""
+
+cpp_decls = """
+torch::Tensor conv1x1_relu_cuda(torch::Tensor input,
+                                torch::Tensor weight,
+                                torch::Tensor bias);
+torch::Tensor channel_concat_cuda(torch::Tensor A,
+                                  torch::Tensor B);
+"""
+
+# Load & compile
+fast_ops = load_inline(
+    name="fast_ops_1x1_concat",
+    cpp_sources=cpp_decls,
+    cuda_sources=cuda_source,
+    functions=["conv1x1_relu_cuda", "channel_concat_cuda"],
+    extra_cflags=["-O3"],
+    extra_cuda_cflags=["-O3"],
+    verbose=False
+)
+
+# ------------------------------------------------------------------
+# Optimised model
+# ------------------------------------------------------------------
+class ModelNew(nn.Module):
+    def __init__(self,
+                 in_channels: int,
+                 squeeze_channels: int,
+                 expand1x1_channels: int,
+                 expand3x3_channels: int):
+        super().__init__()
+
+        # parameters for 1×1 convolutions
+        self.squeeze_weight = nn.Parameter(
+            torch.empty(squeeze_channels, in_channels, 1, 1))
+        self.squeeze_bias = nn.Parameter(torch.empty(squeeze_channels))
+
+        self.expand1x1_weight = nn.Parameter(
+            torch.empty(expand1x1_channels, squeeze_channels, 1, 1))
+        self.expand1x1_bias = nn.Parameter(torch.empty(expand1x1_channels))
+
+        # 3×3 convolution keeps highly-optimised cuDNN implementation
+        self.expand3x3 = nn.Conv2d(
+            squeeze_channels, expand3x3_channels, kernel_size=3, padding=1)
+        
+        # initialise 1×1 conv parameters (same strategy as nn.Conv2d default)
+        self._init_params(in_channels, squeeze_channels)
+
+    def _init_params(self, in_ch, squeeze_ch):
+        nn.init.kaiming_uniform_(self.squeeze_weight, a=math.sqrt(5))
+        fan_in = in_ch
+        bound = 1 / math.sqrt(fan_in)
+        nn.init.uniform_(self.squeeze_bias, -bound, bound)
+
+        nn.init.kaiming_uniform_(self.expand1x1_weight, a=math.sqrt(5))
+        fan_in = squeeze_ch
+        bound = 1 / math.sqrt(fan_in)
+        nn.init.uniform_(self.expand1x1_bias, -bound, bound)
+
+    # ------------------------------------------------------------------
+    # forward
+    # ------------------------------------------------------------------
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 1×1 squeeze + ReLU
+        x = fast_ops.conv1x1_relu_cuda(
+            x,
+            self.squeeze_weight.view(self.squeeze_weight.size(0), -1),
+            self.squeeze_bias
+        )
+        # 1×1 expand + ReLU
+        expand1 = fast_ops.conv1x1_relu_cuda(
+            x,
+            self.expand1x1_weight.view(self.expand1x1_weight.size(0), -1),
+            self.expand1x1_bias
+        )
+        # 3×3 expand + ReLU using cuDNN
+        expand3 = F.relu(self.expand3x3(x), inplace=True)
+
+        # Concatenate along channel dimension
+        out = fast_ops.channel_concat_cuda(expand1, expand3)
+        return out
+```

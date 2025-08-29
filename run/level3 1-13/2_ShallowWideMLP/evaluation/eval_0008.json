@@ -1,0 +1,6 @@
+{
+  "runnable": false,
+  "phase": "repair",
+  "error_type": "RuntimeError",
+  "message": "name 'hidden_layer_sizes' is not defined"
+}

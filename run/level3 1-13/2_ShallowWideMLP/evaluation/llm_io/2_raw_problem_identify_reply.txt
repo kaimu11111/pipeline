@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "PYBIND11_MODULE duplicated → linker multiple-definition",
+  "why_it_matters": "Extension fails to link; fused kernels never build, so ModelNew cannot run and always mismatches reference output.",
+  "minimal_fix_hint": "Remove manual PYBIND11_MODULE or disable auto wrapper."
+}
+```

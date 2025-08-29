@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Custom ReLU turns NaNs into zeros",
+  "why_it_matters": "torch.nn.ReLU keeps NaNs unchanged; overwriting them alters outputs and gradients, diverging from reference semantics.",
+  "minimal_fix_hint": "use fmax(x,0) or propagate NaNs explicitly"
+}
+```

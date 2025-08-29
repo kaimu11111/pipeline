@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "AdaptiveAvgPool2d(1) replaces required AvgPool2d(kernel=7)",
+  "why_it_matters": "Kernel size 1×1 average differs from 7×7; outputs change for any feature map not exactly 7×7, breaking parity.",
+  "minimal_fix_hint": "Use nn.AvgPool2d(7) like reference"
+}
+```

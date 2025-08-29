@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "AvgPool2d(7) receives 4×4 feature map",
+  "why_it_matters": "Kernel size 7 on 4×4 tensor produces 0×0 output, raising runtime error and preventing any forward pass.",
+  "minimal_fix_hint": "replace with nn.AdaptiveAvgPool2d(1)"
+}
+```

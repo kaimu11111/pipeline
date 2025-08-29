@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "No obvious CUDA-side mismatch detected",
+  "why_it_matters": "Kernel and autograd replica exactly PyTorch cls-prepend semantics; gradient logic also matches reference behavior.",
+  "minimal_fix_hint": "No fix necessary"
+}
+```

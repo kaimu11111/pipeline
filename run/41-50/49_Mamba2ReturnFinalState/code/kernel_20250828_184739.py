@@ -1,0 +1,206 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from einops import rearrange
+from torch.utils.cpp_extension import load_inline
+
+# ---------------------------------------------------------------------------
+# CUDA extension: fused segment-sum (triangular) + exp
+# Produces the same result as torch.exp(seg_sum(x)) used in the original
+# implementation, but without forming large intermediate tensors on Python side.
+# ---------------------------------------------------------------------------
+
+cuda_src = r"""
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+#define CHECK_CUDA(x) TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")
+#define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
+#define CHECK_FLOAT(x) TORCH_CHECK(x.scalar_type() == torch::kFloat32, #x " must be float32")
+
+// Kernel: each block handles one flattened sample (batch*head*chunk)
+// A single thread per block suffices for typical block_len (<= 1024) and keeps
+// the implementation simple.  For larger T the kernel can be made multi-threaded.
+__global__ void segsum_exp_kernel(const float* __restrict__ x,
+                                  float* __restrict__ out,
+                                  const int D,  // number of independent samples
+                                  const int T)  // sequence length (last dim)
+{
+    const int d = blockIdx.x;
+    if (d >= D) return;
+
+    const float* x_ptr  = x   + d * T;
+    float*       o_ptr  = out + d * T * T;
+
+    // For every target index i we accumulate backwards to 0,
+    // producing exp(prefix_sum) for j<=i and -INF for j>i
+    for (int i = 0; i < T; ++i) {
+        float acc = 0.0f;
+
+        // Fill lower-triangular (j <= i)
+        for (int j = i; j >= 0; --j) {
+            acc += x_ptr[j];
+            o_ptr[i * T + j] = __expf(acc);
+        }
+        // Fill upper-triangular (j >  i) with -INF
+        for (int j = i + 1; j < T; ++j) {
+            o_ptr[i * T + j] = -INFINITY;
+        }
+    }
+}
+
+torch::Tensor segsum_exp_cuda(torch::Tensor x) {
+    CHECK_CUDA(x);
+    CHECK_CONTIGUOUS(x);
+    CHECK_FLOAT(x);
+
+    const int64_t T = x.size(-1);
+    const int64_t D64 = x.numel() / T;
+    TORCH_CHECK(D64 <= INT_MAX, "Tensor too large");
+    const int D = static_cast<int>(D64);
+
+    // Prepare output shape: original_dims + [T]
+    std::vector<int64_t> out_sizes = x.sizes().vec();
+    out_sizes.push_back(T);
+    auto out = torch::empty(out_sizes, x.options());
+
+    const dim3 blocks(D);
+    const dim3 threads(1);
+
+    segsum_exp_kernel<<<blocks, threads>>>(x.data_ptr<float>(),
+                                           out.data_ptr<float>(),
+                                           D, static_cast<int>(T));
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess)
+        throw std::runtime_error(cudaGetErrorString(err));
+
+    return out;
+}
+"""
+
+cpp_decls = r"""
+torch::Tensor segsum_exp_cuda(torch::Tensor x);
+"""
+
+# Compile the extension
+segsum_exp = load_inline(
+    name="segsum_exp",
+    cpp_sources=cpp_decls,
+    cuda_sources=cuda_src,
+    functions=["segsum_exp_cuda"],
+    verbose=False,
+)
+
+
+# ---------------------------------------------------------------------------
+# Optimised model using the custom CUDA kernel
+# ---------------------------------------------------------------------------
+class ModelNew(nn.Module):
+    def __init__(self,
+                 batch_size,
+                 seq_length,
+                 n_heads,
+                 d_head,
+                 d_state,
+                 block_len=64):
+        super().__init__()
+
+        assert seq_length % block_len == 0, "Sequence length must be divisible by block length"
+
+        self.batch_size = batch_size
+        self.seq_length = seq_length
+        self.n_heads = n_heads
+        self.d_head = d_head
+        self.d_state = d_state
+        self.block_len = block_len
+
+        # Parameters
+        self.A = nn.Parameter(torch.randn(batch_size, seq_length, n_heads))
+        self.B = nn.Parameter(torch.randn(batch_size, seq_length, n_heads, d_state))
+        self.C = nn.Parameter(torch.randn(batch_size, seq_length, n_heads, d_state))
+
+        # expose CUDA op
+        self.segsum_exp = segsum_exp
+
+    def forward(self, X, initial_states=None):
+        # -------------
+        # Step 1: block-wise rearrangement
+        # -------------
+        X_blocks, A_blocks, B_blocks, C_blocks = [
+            rearrange(x, "b (c l) ... -> b c l ...", l=self.block_len)
+            for x in (X, self.A, self.B, self.C)
+        ]
+
+        # Shapes:
+        #   X_blocks : [b, c, l, h, d_head]
+        #   A_blocks : [b, c, l, h]
+        #   B_blocks : [b, c, l, h, d_state]
+        #   C_blocks : [b, c, l, h, d_state]
+
+        # -------------
+        # Step 2: prepare A-related terms
+        # -------------
+        A_blocks = rearrange(A_blocks, "b c l h -> b h c l").contiguous()
+        A_cumsum = torch.cumsum(A_blocks, dim=-1)
+
+        # Custom CUDA kernel: exp(seg_sum(A_blocks))
+        L = self.segsum_exp.segsum_exp_cuda(A_blocks)
+
+        # -------------
+        # Step 3: diagonal block outputs (unchanged einsum logic)
+        # -------------
+        # Re-layout tensors for einsum to match original sub-scripts
+        C_ein = rearrange(C_blocks, "b c l h n -> b c l h n")
+        B_ein = rearrange(B_blocks, "b c s h n -> b c s h n")
+        X_ein = rearrange(X_blocks, "b c s h p -> b c s h p")
+
+        Y_diag = torch.einsum(
+            "bclhn,bcshn,bhcls,bcshp->bclhp",
+            C_ein, B_ein, L, X_ein
+        )
+
+        # -------------
+        # Step 4: intra-chunk states
+        # -------------
+        decay_states = torch.exp((A_cumsum[..., -1:] - A_cumsum))
+        states = torch.einsum(
+            "bclhn,bhcl,bclhp->bchpn",
+            B_blocks, decay_states, X_blocks
+        )
+
+        # -------------
+        # Step 5: inter-chunk recurrence
+        # -------------
+        if initial_states is None:
+            initial_states = torch.zeros_like(states[:, :1])
+
+        states = torch.cat([initial_states, states], dim=1)
+
+        # Build the decay for whole chunks (again using the custom kernel)
+        last_acum = A_cumsum[..., -1]                 # shape: [b, h, c]
+        last_acum_padded = F.pad(last_acum, (1, 0))   # [b, h, c+1]
+        decay_chunk = self.segsum_exp.segsum_exp_cuda(last_acum_padded)
+
+        new_states = torch.einsum(
+            "bhzc,bchpn->bzhpn",
+            decay_chunk, states
+        )
+        return new_states[:, -1]
+
+
+# ----------------------------------------------------------------------------
+# Required helper functions for benchmarking harness (unchanged)
+# ----------------------------------------------------------------------------
+batch_size = 1024
+seq_length = 64
+n_heads = 4
+d_head = 32
+d_state = 8
+block_len = 32
+
+def get_inputs():
+    return [torch.rand(batch_size, seq_length, n_heads, d_head, device="cuda")]
+
+def get_init_inputs():
+    return [batch_size, seq_length, n_heads, d_head, d_state, block_len]

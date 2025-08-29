@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "fc1 expects 1024 features not 9216",
+  "why_it_matters": "Changing fc1 to 256*2*2 alters parameter shapes and entire network output, diverging from reference AlexNet architecture.",
+  "minimal_fix_hint": "set fc1 in_features 256*6*6"
+}
+```

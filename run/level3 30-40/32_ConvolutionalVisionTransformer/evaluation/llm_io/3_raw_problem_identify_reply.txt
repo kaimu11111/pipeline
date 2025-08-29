@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Constructor args keyword-only mismatched",
+  "why_it_matters": "Harness passes embed_dim,num_heads positionally, triggering TypeError so model never builds or runs.",
+  "minimal_fix_hint": "Accept positional args or drop *"
+}
+```

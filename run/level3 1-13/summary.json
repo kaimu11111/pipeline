@@ -1,0 +1,99 @@
+{
+  "avg_speedup": 0.7447736066640684,
+  "accuracy": 0.8461538461538461,
+  "num_tasks": 13,
+  "tasks": [
+    {
+      "task": "KernelBench/level3test/10_ResNet101.py",
+      "best_score": 0.9011853509736008,
+      "best_runnable": true,
+      "task_dir": "/home/wan00559/pipleline/run/20250828_154447_batch_first13/10_ResNet101",
+      "figure": "/home/wan00559/pipleline/run/20250828_154447_batch_first13/10_ResNet101/figures/10_ResNet101_score.png"
+    },
+    {
+      "task": "KernelBench/level3test/11_VGG16.py",
+      "best_score": 1.0413334006668837,
+      "best_runnable": true,
+      "task_dir": "/home/wan00559/pipleline/run/20250828_154447_batch_first13/11_VGG16",
+      "figure": "/home/wan00559/pipleline/run/20250828_154447_batch_first13/11_VGG16/figures/11_VGG16_score.png"
+    },
+    {
+      "task": "KernelBench/level3test/12_VGG19.py",
+      "best_score": 0.5874402414179256,
+      "best_runnable": true,
+      "task_dir": "/home/wan00559/pipleline/run/20250828_154447_batch_first13/12_VGG19",
+      "figure": "/home/wan00559/pipleline/run/20250828_154447_batch_first13/12_VGG19/figures/12_VGG19_score.png"
+    },
+    {
+      "task": "KernelBench/level3test/13_DenseNet121TransitionLayer.py",
+      "best_score": 0.6511387367922559,
+      "best_runnable": true,
+      "task_dir": "/home/wan00559/pipleline/run/20250828_154447_batch_first13/13_DenseNet121TransitionLayer",
+      "figure": "/home/wan00559/pipleline/run/20250828_154447_batch_first13/13_DenseNet121TransitionLayer/figures/13_DenseNet121TransitionLayer_score.png"
+    },
+    {
+      "task": "KernelBench/level3test/1_MLP.py",
+      "best_score": 0.8596473344112806,
+      "best_runnable": true,
+      "task_dir": "/home/wan00559/pipleline/run/20250828_154447_batch_first13/1_MLP",
+      "figure": "/home/wan00559/pipleline/run/20250828_154447_batch_first13/1_MLP/figures/1_MLP_score.png"
+    },
+    {
+      "task": "KernelBench/level3test/2_ShallowWideMLP.py",
+      "best_score": 0.0,
+      "best_runnable": false,
+      "task_dir": "/home/wan00559/pipleline/run/20250828_154447_batch_first13/2_ShallowWideMLP",
+      "figure": "/home/wan00559/pipleline/run/20250828_154447_batch_first13/2_ShallowWideMLP/figures/2_ShallowWideMLP_score.png"
+    },
+    {
+      "task": "KernelBench/level3test/3_DeepNarrowMLP.py",
+      "best_score": 0.4864187155374382,
+      "best_runnable": true,
+      "task_dir": "/home/wan00559/pipleline/run/20250828_154447_batch_first13/3_DeepNarrowMLP",
+      "figure": "/home/wan00559/pipleline/run/20250828_154447_batch_first13/3_DeepNarrowMLP/figures/3_DeepNarrowMLP_score.png"
+    },
+    {
+      "task": "KernelBench/level3test/4_LeNet5.py",
+      "best_score": 1.1733527716258132,
+      "best_runnable": true,
+      "task_dir": "/home/wan00559/pipleline/run/20250828_154447_batch_first13/4_LeNet5",
+      "figure": "/home/wan00559/pipleline/run/20250828_154447_batch_first13/4_LeNet5/figures/4_LeNet5_score.png"
+    },
+    {
+      "task": "KernelBench/level3test/5_AlexNet.py",
+      "best_score": 0.0,
+      "best_runnable": false,
+      "task_dir": "/home/wan00559/pipleline/run/20250828_154447_batch_first13/5_AlexNet",
+      "figure": "/home/wan00559/pipleline/run/20250828_154447_batch_first13/5_AlexNet/figures/5_AlexNet_score.png"
+    },
+    {
+      "task": "KernelBench/level3test/6_GoogleNetInceptionModule.py",
+      "best_score": 1.0638376657350395,
+      "best_runnable": true,
+      "task_dir": "/home/wan00559/pipleline/run/20250828_154447_batch_first13/6_GoogleNetInceptionModule",
+      "figure": "/home/wan00559/pipleline/run/20250828_154447_batch_first13/6_GoogleNetInceptionModule/figures/6_GoogleNetInceptionModule_score.png"
+    },
+    {
+      "task": "KernelBench/level3test/7_GoogleNetInceptionV1.py",
+      "best_score": 0.9184249938623377,
+      "best_runnable": true,
+      "task_dir": "/home/wan00559/pipleline/run/20250828_154447_batch_first13/7_GoogleNetInceptionV1",
+      "figure": "/home/wan00559/pipleline/run/20250828_154447_batch_first13/7_GoogleNetInceptionV1/figures/7_GoogleNetInceptionV1_score.png"
+    },
+    {
+      "task": "KernelBench/level3test/8_ResNetBasicBlock.py",
+      "best_score": 1.0316305123653342,
+      "best_runnable": true,
+      "task_dir": "/home/wan00559/pipleline/run/20250828_154447_batch_first13/8_ResNetBasicBlock",
+      "figure": "/home/wan00559/pipleline/run/20250828_154447_batch_first13/8_ResNetBasicBlock/figures/8_ResNetBasicBlock_score.png"
+    },
+    {
+      "task": "KernelBench/level3test/9_ResNet18.py",
+      "best_score": 0.9676471632449788,
+      "best_runnable": true,
+      "task_dir": "/home/wan00559/pipleline/run/20250828_154447_batch_first13/9_ResNet18",
+      "figure": "/home/wan00559/pipleline/run/20250828_154447_batch_first13/9_ResNet18/figures/9_ResNet18_score.png"
+    }
+  ],
+  "timestamp": "2025-08-28 17:20:52"
+}

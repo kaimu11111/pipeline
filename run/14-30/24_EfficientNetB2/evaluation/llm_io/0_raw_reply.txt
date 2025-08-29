@@ -1,0 +1,169 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+###############################################################################
+#                           Custom CUDA Operator                              #
+###############################################################################
+gap_cuda_src = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void gap_kernel(const float* __restrict__ x,
+                           float* __restrict__ y,
+                           int N, int C, int H, int W) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;        // 0 … N*C-1
+    int total = N * C;
+    if (idx >= total) return;
+
+    int n = idx / C;
+    int c = idx % C;
+    int stride_n = C * H * W;
+    int stride_c = H * W;
+
+    const float* in_ptr = x + n * stride_n + c * stride_c;
+
+    float sum = 0.f;
+    for (int i = 0; i < stride_c; ++i) {
+        sum += in_ptr[i];
+    }
+    y[n * C + c] = sum / static_cast<float>(stride_c);
+}
+
+torch::Tensor global_avg_pool_cuda(torch::Tensor input) {
+    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
+    TORCH_CHECK(input.scalar_type() == torch::kFloat32, "only float32 supported");
+
+    const int N = input.size(0);
+    const int C = input.size(1);
+    const int H = input.size(2);
+    const int W = input.size(3);
+
+    auto output = torch::empty({N, C}, input.options());
+
+    int threads = 256;
+    int blocks  = (N * C + threads - 1) / threads;
+
+    gap_kernel<<<blocks, threads>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        N, C, H, W);
+
+    // reshape to (N, C, 1, 1) to be drop-in for 2D conv layers
+    return output.view({N, C, 1, 1});
+}
+"""
+
+gap_cpp_decls = "torch::Tensor global_avg_pool_cuda(torch::Tensor input);"
+
+gap_module = load_inline(
+    name="fast_gap",
+    cpp_sources=gap_cpp_decls,
+    cuda_sources=gap_cuda_src,
+    functions=["global_avg_pool_cuda"],
+    verbose=False,
+)
+
+class GlobalAvgPool2dFast(nn.Module):
+    """Drop-in replacement for nn.AdaptiveAvgPool2d((1,1)) implemented in CUDA."""
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Ensure contiguous memory layout for the kernel
+        return gap_module.global_avg_pool_cuda(x.contiguous())
+
+###############################################################################
+#                              Optimised Model                                #
+###############################################################################
+class ModelNew(nn.Module):
+    def __init__(self, num_classes: int = 1000) -> None:
+        """
+        EfficientNetB2 architecture with custom CUDA global-average-pool operator.
+        """
+        super().__init__()
+
+        # Stem
+        self.conv1 = nn.Conv2d(3, 32, kernel_size=3, stride=2,
+                               padding=1, bias=False)
+        self.bn1   = nn.BatchNorm2d(32)
+        self.relu  = nn.ReLU(inplace=True)
+
+        # MBConv blocks
+        self.mbconv1 = self._make_mbconv_block(32,  96, stride=1, expand_ratio=3)
+        self.mbconv2 = self._make_mbconv_block(96,  144, stride=2, expand_ratio=6)
+        self.mbconv3 = self._make_mbconv_block(144, 192, stride=2, expand_ratio=6)
+        self.mbconv4 = self._make_mbconv_block(192, 288, stride=2, expand_ratio=6)
+        self.mbconv5 = self._make_mbconv_block(288, 384, stride=1, expand_ratio=6)
+
+        # Head
+        self.conv_final = nn.Conv2d(384, 1408, kernel_size=1,
+                                    stride=1, padding=0, bias=False)
+        self.bn_final = nn.BatchNorm2d(1408)
+        self.avgpool  = GlobalAvgPool2dFast()          # uses custom CUDA kernel
+        self.fc       = nn.Linear(1408, num_classes)
+
+    # --------------------------------------------------------------------- #
+    def _make_mbconv_block(self, in_ch: int, out_ch: int,
+                           stride: int, expand_ratio: int) -> nn.Sequential:
+        layers = []
+        exp_ch = in_ch * expand_ratio
+
+        # expansion phase
+        if expand_ratio != 1:
+            layers += [
+                nn.Conv2d(in_ch, exp_ch, kernel_size=1, bias=False),
+                nn.BatchNorm2d(exp_ch),
+                nn.ReLU(inplace=True),
+            ]
+
+        # depthwise conv
+        layers += [
+            nn.Conv2d(exp_ch, exp_ch, kernel_size=3, stride=stride,
+                      padding=1, groups=exp_ch, bias=False),
+            nn.BatchNorm2d(exp_ch),
+            nn.ReLU(inplace=True),
+        ]
+
+        # squeeze-and-excitation (uses fast GAP)
+        layers += [
+            GlobalAvgPool2dFast(),
+            nn.Conv2d(exp_ch, exp_ch // 4, kernel_size=1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(exp_ch // 4, exp_ch, kernel_size=1, bias=False),
+            nn.Sigmoid(),
+        ]
+
+        # projection
+        layers += [
+            nn.Conv2d(exp_ch, out_ch, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+        ]
+        return nn.Sequential(*layers)
+
+    # --------------------------------------------------------------------- #
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.relu(self.bn1(self.conv1(x)))
+        x = self.mbconv1(x)
+        x = self.mbconv2(x)
+        x = self.mbconv3(x)
+        x = self.mbconv4(x)
+        x = self.mbconv5(x)
+        x = self.relu(self.bn_final(self.conv_final(x)))
+        x = self.avgpool(x)           # (N, 1408, 1, 1)
+        x = torch.flatten(x, 1)       # (N, 1408)
+        return self.fc(x)
+
+###############################################################################
+#                                Utilities                                   #
+###############################################################################
+batch_size = 2
+num_classes = 100
+
+def get_inputs():
+    return [torch.rand(batch_size, 3, 112, 112).cuda()]
+
+def get_init_inputs():
+    return [num_classes]
+```

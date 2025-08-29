@@ -1,0 +1,176 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# -----------------------------------------------------------------------
+# Custom CUDA kernels: ReLU6 (forward & backward) and element-wise add
+# -----------------------------------------------------------------------
+cuda_src = r"""
+#include <torch/extension.h>
+#include <ATen/ATen.h>
+#include <cuda_runtime.h>
+
+template<typename scalar_t>
+__global__ void relu6_forward_kernel(const scalar_t* __restrict__ x,
+                                     scalar_t* __restrict__ y,
+                                     const size_t n) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        scalar_t v = x[idx];
+        v = v > scalar_t(0) ? v : scalar_t(0);
+        v = v < scalar_t(6) ? v : scalar_t(6);
+        y[idx] = v;
+    }
+}
+
+template<typename scalar_t>
+__global__ void relu6_backward_kernel(const scalar_t* __restrict__ grad_out,
+                                      const scalar_t* __restrict__ x,
+                                      scalar_t* __restrict__ grad_in,
+                                      const size_t n) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        scalar_t v = x[idx];
+        grad_in[idx] = (v > scalar_t(0) && v < scalar_t(6)) ? grad_out[idx] : scalar_t(0);
+    }
+}
+
+template<typename scalar_t>
+__global__ void add_kernel(const scalar_t* __restrict__ a,
+                           const scalar_t* __restrict__ b,
+                           scalar_t* __restrict__ out,
+                           const size_t n) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        out[idx] = a[idx] + b[idx];
+    }
+}
+
+torch::Tensor relu6_forward_cuda(torch::Tensor x) {
+    auto y = torch::empty_like(x);
+    const size_t n = x.numel();
+    const int threads = 256;
+    const int blocks  = (n + threads - 1) / threads;
+
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(x.scalar_type(), "relu6_forward_cuda", ([&] {
+        relu6_forward_kernel<scalar_t><<<blocks, threads>>>(
+            x.data_ptr<scalar_t>(),
+            y.data_ptr<scalar_t>(),
+            n);
+    }));
+    return y;
+}
+
+torch::Tensor relu6_backward_cuda(torch::Tensor grad_out, torch::Tensor x) {
+    auto grad_in = torch::empty_like(grad_out);
+    const size_t n = x.numel();
+    const int threads = 256;
+    const int blocks  = (n + threads - 1) / threads;
+
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(x.scalar_type(), "relu6_backward_cuda", ([&] {
+        relu6_backward_kernel<scalar_t><<<blocks, threads>>>(
+            grad_out.data_ptr<scalar_t>(),
+            x.data_ptr<scalar_t>(),
+            grad_in.data_ptr<scalar_t>(),
+            n);
+    }));
+    return grad_in;
+}
+
+torch::Tensor add_cuda(torch::Tensor a, torch::Tensor b) {
+    auto out = torch::empty_like(a);
+    const size_t n = a.numel();
+    const int threads = 256;
+    const int blocks  = (n + threads - 1) / threads;
+
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(a.scalar_type(), "add_cuda", ([&] {
+        add_kernel<scalar_t><<<blocks, threads>>>(
+            a.data_ptr<scalar_t>(),
+            b.data_ptr<scalar_t>(),
+            out.data_ptr<scalar_t>(),
+            n);
+    }));
+    return out;
+}
+"""
+
+cpp_src = r"""
+torch::Tensor relu6_forward_cuda(torch::Tensor x);
+torch::Tensor relu6_backward_cuda(torch::Tensor grad_out, torch::Tensor x);
+torch::Tensor add_cuda(torch::Tensor a, torch::Tensor b);
+"""
+
+fast_ops = load_inline(
+    name="fast_ops",
+    cpp_sources=cpp_src,
+    cuda_sources=cuda_src,
+    functions=["relu6_forward_cuda", "relu6_backward_cuda", "add_cuda"],
+    extra_cuda_cflags=["-O3"],
+    verbose=False,
+)
+
+# -----------------------------------------------------------------------
+# Autograd-compatible ReLU6 using the custom kernels
+# -----------------------------------------------------------------------
+class _ReLU6Function(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        x = x.contiguous()
+        y = fast_ops.relu6_forward_cuda(x)
+        ctx.save_for_backward(x)
+        return y
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        (x,) = ctx.saved_tensors
+        grad_out = grad_out.contiguous()
+        grad_in = fast_ops.relu6_backward_cuda(grad_out, x)
+        return grad_in
+
+class ReLU6Fast(nn.Module):
+    def forward(self, x):
+        return _ReLU6Function.apply(x)
+
+# -----------------------------------------------------------------------
+# Optimised MBConv block
+# -----------------------------------------------------------------------
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, expand_ratio):
+        super(ModelNew, self).__init__()
+        self.use_residual = (stride == 1 and in_channels == out_channels)
+        hidden_dim = in_channels * expand_ratio
+
+        if expand_ratio != 1:
+            self.expand_conv = nn.Sequential(
+                nn.Conv2d(in_channels, hidden_dim, kernel_size=1, stride=1,
+                          padding=0, bias=False),
+                nn.BatchNorm2d(hidden_dim),
+                ReLU6Fast()
+            )
+
+        self.depthwise_conv = nn.Sequential(
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=kernel_size, stride=stride,
+                      padding=(kernel_size - 1) // 2, groups=hidden_dim, bias=False),
+            nn.BatchNorm2d(hidden_dim),
+            ReLU6Fast()
+        )
+
+        self.project_conv = nn.Sequential(
+            nn.Conv2d(hidden_dim, out_channels, kernel_size=1, stride=1,
+                      padding=0, bias=False),
+            nn.BatchNorm2d(out_channels)
+        )
+
+    def forward(self, x):
+        identity = x
+
+        if hasattr(self, 'expand_conv'):
+            x = self.expand_conv(x)
+
+        x = self.depthwise_conv(x)
+        x = self.project_conv(x)
+
+        if self.use_residual:
+            x = fast_ops.add_cuda(x, identity)
+
+        return x

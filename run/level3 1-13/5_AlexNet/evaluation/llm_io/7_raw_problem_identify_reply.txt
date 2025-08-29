@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "fc1 built for 256*2*2=1024, ref needs 256*6*6=9216",
+  "why_it_matters": "Dimension mismatch changes parameters and activations; outputs diverge and reference even crashes during matmul.",
+  "minimal_fix_hint": "define fc1 with 9216 in_features"
+}
+```

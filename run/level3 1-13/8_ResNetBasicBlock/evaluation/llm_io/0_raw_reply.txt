@@ -1,0 +1,110 @@
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+#############################################
+# Custom CUDA kernel: fused add + ReLU
+#############################################
+cuda_src = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+template <typename scalar_t>
+__global__ void add_relu_kernel(const scalar_t* __restrict__ a,
+                                const scalar_t* __restrict__ b,
+                                scalar_t* __restrict__ out,
+                                int64_t size) {
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        scalar_t val = a[idx] + b[idx];
+        out[idx] = val > scalar_t(0) ? val : scalar_t(0);
+    }
+}
+
+torch::Tensor add_relu_cuda(torch::Tensor a, torch::Tensor b) {
+    TORCH_CHECK(a.is_cuda() && b.is_cuda(), "Tensors must be CUDA tensors");
+    TORCH_CHECK(a.numel() == b.numel(), "Input sizes must match");
+
+    auto out = torch::empty_like(a);
+    const int64_t size = a.numel();
+    const int threads = 256;
+    const int blocks = (size + threads - 1) / threads;
+
+    AT_DISPATCH_FLOATING_TYPES(a.scalar_type(), "add_relu_cuda", ([&] {
+        add_relu_kernel<<<blocks, threads>>>(a.data_ptr<scalar_t>(),
+                                             b.data_ptr<scalar_t>(),
+                                             out.data_ptr<scalar_t>(),
+                                             size);
+    }));
+    return out;
+}
+"""
+
+cpp_decl = r"""
+torch::Tensor add_relu_cuda(torch::Tensor a, torch::Tensor b);
+"""
+
+add_relu = load_inline(
+    name="fused_add_relu",
+    cpp_sources=cpp_decl,
+    cuda_sources=cuda_src,
+    functions=["add_relu_cuda"],
+    verbose=False,
+)
+
+#############################################
+# Optimized model using the fused kernel
+#############################################
+class ModelNew(nn.Module):
+    expansion = 1
+
+    def __init__(self, in_channels, out_channels, stride=1):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3,
+                               stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3,
+                               stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.downsample = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels * self.expansion, kernel_size=1,
+                      stride=stride, bias=False),
+            nn.BatchNorm2d(out_channels * self.expansion),
+        )
+        self.stride = stride
+        # reference to the compiled CUDA extension
+        self.add_relu = add_relu
+
+    def forward(self, x):
+        identity = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = F.relu(out, inplace=True)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+
+        if self.downsample is not None:
+            identity = self.downsample(x)
+
+        # fused add + ReLU kernel
+        out = self.add_relu.add_relu_cuda(out.contiguous(), identity.contiguous())
+
+        return out
+
+
+# Required helper functions
+batch_size = 5
+in_channels = 3
+out_channels = 32
+stride = 1
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, 224, 224).cuda()]
+
+def get_init_inputs():
+    return [in_channels, out_channels, stride]
+```

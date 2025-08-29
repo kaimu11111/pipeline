@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Duplicate PYBIND11_MODULE definition in cuda_src and auto-generated stub",
+  "why_it_matters": "Linker finds two PyInit_fused_pool_hardtanh_mean_tanh symbols, build fails, kernel never runs so model outputs nothing.",
+  "minimal_fix_hint": "Delete PYBIND11_MODULE block from cuda_src"
+}
+```

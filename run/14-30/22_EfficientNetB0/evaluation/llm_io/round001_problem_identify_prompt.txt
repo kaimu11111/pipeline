@@ -1,0 +1,365 @@
+You are given:
+
+ERROR_LOG:
+/home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/utils/cpp_extension.py:2356: UserWarning: TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'].
+  warnings.warn(
+Error building extension 'effnet_custom_ops': [1/3] c++ -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=effnet_custom_ops -DTORCH_API_INCLUDE_EXTENSION_H -DPYBIND11_COMPILER_TYPE=\"_gcc\" -DPYBIND11_STDLIB=\"_libstdcpp\" -DPYBIND11_BUILD_ABI=\"_cxxabi1016\" -isystem /home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/include -isystem /home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/include/torch/csrc/api/include -isystem /home/wan00559/miniconda3/envs/maxk/include/python3.11 -D_GLIBCXX_USE_CXX11_ABI=1 -fPIC -std=c++17 -c /home/wan00559/.cache/torch_extensions/py311_cu126/effnet_custom_ops/main.cpp -o main.o 
+[2/3] /usr/bin/nvcc --generate-dependencies-with-compile --dependency-output cuda.cuda.o.d -DTORCH_EXTENSION_NAME=effnet_custom_ops -DTORCH_API_INCLUDE_EXTENSION_H -DPYBIND11_COMPILER_TYPE=\"_gcc\" -DPYBIND11_STDLIB=\"_libstdcpp\" -DPYBIND11_BUILD_ABI=\"_cxxabi1016\" -isystem /home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/include -isystem /home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/include/torch/csrc/api/include -isystem /home/wan00559/miniconda3/envs/maxk/include/python3.11 -D_GLIBCXX_USE_CXX11_ABI=1 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_75,code=compute_75 -gencode=arch=compute_75,code=sm_75 --compiler-options '-fPIC' -std=c++17 -c /home/wan00559/.cache/torch_extensions/py311_cu126/effnet_custom_ops/cuda.cu -o cuda.cuda.o 
+[3/3] c++ main.o cuda.cuda.o -shared -L/home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/lib -lc10 -lc10_cuda -ltorch_cpu -ltorch_cuda -ltorch -ltorch_python -L/usr/lib64 -lcudart -o effnet_custom_ops.so
+FAILED: effnet_custom_ops.so 
+c++ main.o cuda.cuda.o -shared -L/home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/lib -lc10 -lc10_cuda -ltorch_cpu -ltorch_cuda -ltorch -ltorch_python -L/usr/lib64 -lcudart -o effnet_custom_ops.so
+/usr/bin/ld: cuda.cuda.o: in function `PyInit_effnet_custom_ops':
+tmpxft_0001fe63_00000000-6_cuda.cudafe1.cpp:(.text+0x74b): multiple definition of `PyInit_effnet_custom_ops'; main.o:main.cpp:(.text+0x257): first defined here
+collect2: error: ld returned 1 exit status
+ninja: build stopped: subcommand failed.
+
+PyTorch reference (ground truth):
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class Model(nn.Module):
+    def __init__(self, num_classes=1000):
+        """
+        EfficientNetB0 architecture implementation in PyTorch.
+
+        :param num_classes: The number of output classes (default is 1000 for ImageNet).
+        """
+        super(Model, self).__init__()
+        
+        # Initial convolutional layer
+        self.conv1 = nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(32)
+        
+        # MBConv blocks
+        self.blocks = nn.Sequential(
+            # MBConv1 (32, 16, 1, 1)
+            MBConv(32, 16, kernel_size=3, stride=1, expand_ratio=1),
+            # MBConv6 (16, 24, 2, 6)
+            MBConv(16, 24, kernel_size=3, stride=2, expand_ratio=6),
+            # MBConv6 (24, 24, 1, 6)
+            MBConv(24, 24, kernel_size=3, stride=1, expand_ratio=6),
+            # MBConv6 (24, 40, 2, 6)
+            MBConv(24, 40, kernel_size=5, stride=2, expand_ratio=6),
+            # MBConv6 (40, 40, 1, 6)
+            MBConv(40, 40, kernel_size=5, stride=1, expand_ratio=6),
+            # MBConv6 (40, 80, 2, 6)
+            MBConv(40, 80, kernel_size=3, stride=2, expand_ratio=6),
+            # MBConv6 (80, 80, 1, 6)
+            MBConv(80, 80, kernel_size=3, stride=1, expand_ratio=6),
+            # MBConv6 (80, 112, 1, 6)
+            MBConv(80, 112, kernel_size=5, stride=1, expand_ratio=6),
+            # MBConv6 (112, 112, 1, 6)
+            MBConv(112, 112, kernel_size=5, stride=1, expand_ratio=6),
+            # MBConv6 (112, 192, 2, 6)
+            MBConv(112, 192, kernel_size=5, stride=2, expand_ratio=6),
+            # MBConv6 (192, 192, 1, 6)
+            MBConv(192, 192, kernel_size=5, stride=1, expand_ratio=6),
+            # MBConv6 (192, 192, 1, 6)
+            MBConv(192, 192, kernel_size=5, stride=1, expand_ratio=6),
+            # MBConv6 (192, 320, 1, 6)
+            MBConv(192, 320, kernel_size=3, stride=1, expand_ratio=6)
+        )
+        
+        # Final convolutional layer
+        self.conv2 = nn.Conv2d(320, 1280, kernel_size=1, stride=1, padding=0, bias=False)
+        self.bn2 = nn.BatchNorm2d(1280)
+        
+        # Fully connected layer
+        self.fc = nn.Linear(1280, num_classes)
+    
+    def forward(self, x):
+        """
+        Forward pass of the EfficientNetB0 model.
+
+        :param x: The input tensor, shape (batch_size, 3, 224, 224)
+        :return: The output tensor, shape (batch_size, num_classes)
+        """
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = self.blocks(x)
+        x = F.relu(self.bn2(self.conv2(x)))
+        x = F.adaptive_avg_pool2d(x, (1, 1))
+        x = x.view(x.size(0), -1)
+        x = self.fc(x)
+        return x
+
+class MBConv(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, expand_ratio):
+        """
+        MBConv block implementation.
+
+        :param in_channels: Number of input channels.
+        :param out_channels: Number of output channels.
+        :param kernel_size: Kernel size for the depthwise convolution.
+        :param stride: Stride for the depthwise convolution.
+        :param expand_ratio: Expansion ratio for the intermediate channels.
+        """
+        super(MBConv, self).__init__()
+        
+        self.use_residual = (stride == 1 and in_channels == out_channels)
+        hidden_dim = in_channels * expand_ratio
+        
+        if expand_ratio != 1:
+            self.expand_conv = nn.Sequential(
+                nn.Conv2d(in_channels, hidden_dim, kernel_size=1, stride=1, padding=0, bias=False),
+                nn.BatchNorm2d(hidden_dim),
+                nn.ReLU6(inplace=True)
+            )
+        
+        self.depthwise_conv = nn.Sequential(
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=kernel_size, stride=stride, padding=(kernel_size-1)//2, groups=hidden_dim, bias=False),
+            nn.BatchNorm2d(hidden_dim),
+            nn.ReLU6(inplace=True)
+        )
+        
+        self.project_conv = nn.Sequential(
+            nn.Conv2d(hidden_dim, out_channels, kernel_size=1, stride=1, padding=0, bias=False),
+            nn.BatchNorm2d(out_channels)
+        )
+    
+    def forward(self, x):
+        """
+        Forward pass of the MBConv block.
+
+        :param x: The input tensor, shape (batch_size, in_channels, H, W)
+        :return: The output tensor, shape (batch_size, out_channels, H', W')
+        """
+        identity = x
+        
+        if hasattr(self, 'expand_conv'):
+            x = self.expand_conv(x)
+        
+        x = self.depthwise_conv(x)
+        x = self.project_conv(x)
+        
+        if self.use_residual:
+            x += identity
+        
+        return x
+
+# Test code
+batch_size = 5
+num_classes = 100
+
+def get_inputs():
+    return [torch.rand(batch_size, 3, 112, 112)]
+
+def get_init_inputs():
+    return [num_classes]
+
+CUDA candidate (to audit):
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# ----------------------------------------------------------------------
+# Compile CUDA kernels: residual add & global average pooling (1×1)
+# ----------------------------------------------------------------------
+cuda_src = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+/* ---------------- Element-wise residual add ---------------- */
+__global__ void elementwise_add_kernel(const float* a,
+                                       const float* b,
+                                       float* out,
+                                       int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        out[idx] = a[idx] + b[idx];
+    }
+}
+
+torch::Tensor residual_add_cuda(torch::Tensor a, torch::Tensor b) {
+    TORCH_CHECK(a.is_contiguous() && b.is_contiguous(), "Inputs must be contiguous");
+    TORCH_CHECK(a.sizes() == b.sizes(), "Input sizes must match");
+
+    auto out = torch::empty_like(a);
+    int n = a.numel();
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    elementwise_add_kernel<<<blocks, threads>>>(
+        a.data_ptr<float>(),
+        b.data_ptr<float>(),
+        out.data_ptr<float>(),
+        n);
+    return out;
+}
+
+/* ---------------- Global average pool (N,C,H,W) → (N,C) ---------------- */
+__global__ void global_avg_pool_kernel(const float* __restrict__ x,
+                                       float* __restrict__ out,
+                                       int N, int C, int HW) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N * C) return;
+
+    int n = idx / C;
+    int c = idx - n * C;
+
+    const float* inp_ptr = x + (n * C + c) * HW;
+
+    float sum = 0.f;
+    for (int i = 0; i < HW; ++i)
+        sum += inp_ptr[i];
+
+    out[idx] = sum / HW;
+}
+
+torch::Tensor global_avg_pool_cuda(torch::Tensor x) {
+    TORCH_CHECK(x.dim() == 4, "Expected 4-D tensor (N,C,H,W)");
+    TORCH_CHECK(x.is_contiguous(), "Tensor must be contiguous");
+
+    int N = x.size(0);
+    int C = x.size(1);
+    int H = x.size(2);
+    int W = x.size(3);
+    int HW = H * W;
+
+    auto out = torch::empty({N, C}, x.options());
+    int threads = 256;
+    int blocks = (N * C + threads - 1) / threads;
+
+    global_avg_pool_kernel<<<blocks, threads>>>(
+        x.data_ptr<float>(),
+        out.data_ptr<float>(),
+        N, C, HW);
+
+    return out;
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("residual_add_cuda", &residual_add_cuda, "Residual element-wise add (CUDA)");
+    m.def("global_avg_pool_cuda", &global_avg_pool_cuda, "Global average pool (CUDA)");
+}
+"""
+
+cpp_src = """
+torch::Tensor residual_add_cuda(torch::Tensor a, torch::Tensor b);
+torch::Tensor global_avg_pool_cuda(torch::Tensor x);
+"""
+
+custom_ops = load_inline(
+    name="effnet_custom_ops",
+    cpp_sources=cpp_src,
+    cuda_sources=cuda_src,
+    functions=["residual_add_cuda", "global_avg_pool_cuda"],
+    verbose=False,
+)
+
+# ----------------------------------------------------------------------
+# Thin Python wrappers for the custom CUDA ops
+# ----------------------------------------------------------------------
+class ResidualAddFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, a, b):
+        return custom_ops.residual_add_cuda(a.contiguous(), b.contiguous())
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        # dL/da = dL/db = grad_out
+        return grad_out, grad_out
+
+
+def residual_add(a, b):
+    return ResidualAddFunction.apply(a, b)
+
+
+class GlobalAvgPool2d(nn.Module):
+    def forward(self, x):
+        # returns shape (N, C)
+        return custom_ops.global_avg_pool_cuda(x.contiguous())
+
+
+# ----------------------------------------------------------------------
+# MBConv block with custom residual add
+# ----------------------------------------------------------------------
+class MBConvNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, expand_ratio):
+        super().__init__()
+        self.use_residual = (stride == 1 and in_channels == out_channels)
+        hidden_dim = in_channels * expand_ratio
+
+        if expand_ratio != 1:
+            self.expand_conv = nn.Sequential(
+                nn.Conv2d(in_channels, hidden_dim, 1, bias=False),
+                nn.BatchNorm2d(hidden_dim),
+                nn.ReLU6(inplace=True),
+            )
+
+        self.depthwise_conv = nn.Sequential(
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size, stride,
+                      padding=(kernel_size - 1) // 2, groups=hidden_dim, bias=False),
+            nn.BatchNorm2d(hidden_dim),
+            nn.ReLU6(inplace=True),
+        )
+
+        self.project_conv = nn.Sequential(
+            nn.Conv2d(hidden_dim, out_channels, 1, bias=False),
+            nn.BatchNorm2d(out_channels),
+        )
+
+    def forward(self, x):
+        identity = x
+
+        if hasattr(self, "expand_conv"):
+            x = self.expand_conv(x)
+
+        x = self.depthwise_conv(x)
+        x = self.project_conv(x)
+
+        if self.use_residual:
+            x = residual_add(x, identity)
+
+        return x
+
+
+# ----------------------------------------------------------------------
+# EfficientNet-B0 variant using the custom CUDA kernels
+# ----------------------------------------------------------------------
+class ModelNew(nn.Module):
+    def __init__(self, num_classes=1000):
+        super().__init__()
+
+        # Stem
+        self.conv1 = nn.Conv2d(3, 32, 3, stride=2, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(32)
+
+        # Stacked MBConv blocks
+        self.blocks = nn.Sequential(
+            MBConvNew(32, 16, 3, 1, 1),
+            MBConvNew(16, 24, 3, 2, 6),
+            MBConvNew(24, 24, 3, 1, 6),
+            MBConvNew(24, 40, 5, 2, 6),
+            MBConvNew(40, 40, 5, 1, 6),
+            MBConvNew(40, 80, 3, 2, 6),
+            MBConvNew(80, 80, 3, 1, 6),
+            MBConvNew(80, 112, 5, 1, 6),
+            MBConvNew(112, 112, 5, 1, 6),
+            MBConvNew(112, 192, 5, 2, 6),
+            MBConvNew(192, 192, 5, 1, 6),
+            MBConvNew(192, 192, 5, 1, 6),
+            MBConvNew(192, 320, 3, 1, 6),
+        )
+
+        # Head
+        self.conv2 = nn.Conv2d(320, 1280, 1, bias=False)
+        self.bn2 = nn.BatchNorm2d(1280)
+
+        # Pool & classifier
+        self.gap = GlobalAvgPool2d()
+        self.fc = nn.Linear(1280, num_classes)
+
+    def forward(self, x):
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = self.blocks(x)
+        x = F.relu(self.bn2(self.conv2(x)))
+        x = self.gap(x)          # (N, 1280)
+        x = self.fc(x)
+        return x
+
+
+Follow the Rules and produce the JSON exactly in the specified format.

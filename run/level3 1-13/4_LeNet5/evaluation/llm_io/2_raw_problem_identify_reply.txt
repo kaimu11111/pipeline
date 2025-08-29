@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Uses undefined macro TORCH_CUDA_CHECK",
+  "why_it_matters": "Compilation aborts, CUDA extension never builds, so forward pass cannot run and outputs diverge completely.",
+  "minimal_fix_hint": "Replace with AT_CUDA_CHECK(cudaGetLastError())"
+}
+```

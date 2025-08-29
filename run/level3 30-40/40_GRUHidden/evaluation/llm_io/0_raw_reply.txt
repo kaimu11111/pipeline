@@ -1,0 +1,170 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# ---------------------------------------------------------------------------
+# CUDA kernel: single-step GRU update, fusing gate activations & hidden update
+# ---------------------------------------------------------------------------
+cuda_src = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <vector>
+
+template <typename scalar_t>
+__device__ __forceinline__ scalar_t sigmoidf(scalar_t x) {
+    return scalar_t(1) / (scalar_t(1) + expf(-x));
+}
+
+template <typename scalar_t>
+__global__ void gru_step_kernel(
+        const scalar_t* __restrict__ x_r,
+        const scalar_t* __restrict__ x_z,
+        const scalar_t* __restrict__ x_n,
+        const scalar_t* __restrict__ h_r,
+        const scalar_t* __restrict__ h_z,
+        const scalar_t* __restrict__ h_n,
+        const scalar_t* __restrict__ h_prev,
+        scalar_t*       __restrict__ h_out,
+        int hidden_size,
+        int total_elems)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_elems) return;
+
+    scalar_t r  = sigmoidf(x_r[idx] + h_r[idx]);
+    scalar_t z  = sigmoidf(x_z[idx] + h_z[idx]);
+    scalar_t n  = tanhf(x_n[idx] + r * h_n[idx]);
+    scalar_t hp = h_prev[idx];
+    h_out[idx]  = (scalar_t(1) - z) * n + z * hp;
+}
+
+std::vector<torch::Tensor> gru_step_cuda(
+        torch::Tensor x_r,
+        torch::Tensor x_z,
+        torch::Tensor x_n,
+        torch::Tensor h_r,
+        torch::Tensor h_z,
+        torch::Tensor h_n,
+        torch::Tensor h_prev) {
+
+    TORCH_CHECK(x_r.is_cuda(), "All tensors must be on CUDA");
+    int batch_size  = x_r.size(0);
+    int hidden_size = x_r.size(1);
+    int total       = batch_size * hidden_size;
+
+    auto h_out = torch::empty_like(h_prev);
+
+    const int threads = 256;
+    const int blocks  = (total + threads - 1) / threads;
+
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(x_r.scalar_type(), "gru_step_cuda", ([&] {
+        gru_step_kernel<scalar_t><<<blocks, threads>>>(
+            x_r.template data_ptr<scalar_t>(),
+            x_z.template data_ptr<scalar_t>(),
+            x_n.template data_ptr<scalar_t>(),
+            h_r.template data_ptr<scalar_t>(),
+            h_z.template data_ptr<scalar_t>(),
+            h_n.template data_ptr<scalar_t>(),
+            h_prev.template data_ptr<scalar_t>(),
+            h_out.template data_ptr<scalar_t>(),
+            hidden_size,
+            total);
+    }));
+
+    return {h_out};
+}
+"""
+
+cpp_src = r"""
+std::vector<torch::Tensor> gru_step_cuda(
+        torch::Tensor x_r,
+        torch::Tensor x_z,
+        torch::Tensor x_n,
+        torch::Tensor h_r,
+        torch::Tensor h_z,
+        torch::Tensor h_n,
+        torch::Tensor h_prev);
+"""
+
+# Compile the inline CUDA/C++ code
+gru_cuda = load_inline(
+    name        = "gru_fused_step",
+    cpp_sources = cpp_src,
+    cuda_sources= cuda_src,
+    functions   = ["gru_step_cuda"],
+    verbose     = False,
+)
+
+# ---------------------------------------------------------------------------
+# PyTorch modules wrapping the fused CUDA kernel
+# ---------------------------------------------------------------------------
+class FusedGRULayer(nn.Module):
+    """One GRU layer using the fused CUDA step kernel."""
+    def __init__(self, input_size: int, hidden_size: int, bias: bool = True):
+        super().__init__()
+        self.W_ir = nn.Linear(input_size,  hidden_size, bias=bias)
+        self.W_iz = nn.Linear(input_size,  hidden_size, bias=bias)
+        self.W_in = nn.Linear(input_size,  hidden_size, bias=bias)
+
+        self.W_hr = nn.Linear(hidden_size, hidden_size, bias=bias)
+        self.W_hz = nn.Linear(hidden_size, hidden_size, bias=bias)
+        self.W_hn = nn.Linear(hidden_size, hidden_size, bias=bias)
+
+    def forward_step(self, x_t: torch.Tensor, h_prev: torch.Tensor) -> torch.Tensor:
+        # Compute gate pre-activations
+        x_r = self.W_ir(x_t)
+        x_z = self.W_iz(x_t)
+        x_n = self.W_in(x_t)
+
+        h_r = self.W_hr(h_prev)
+        h_z = self.W_hz(h_prev)
+        h_n = self.W_hn(h_prev)
+
+        # Fused CUDA kernel
+        h_out = gru_cuda.gru_step_cuda(
+            x_r.contiguous(), x_z.contiguous(), x_n.contiguous(),
+            h_r.contiguous(), h_z.contiguous(), h_n.contiguous(),
+            h_prev.contiguous()
+        )[0]
+        return h_out
+
+
+class ModelNew(nn.Module):
+    """
+    Custom multi-layer GRU (unidirectional, no dropout) using a fused CUDA
+    kernel for the per-time-step recurrence.
+    The interface mirrors the original Model: forward returns only h_n.
+    """
+    def __init__(self, input_size, hidden_size, num_layers=3,
+                 bias=True, batch_first=False):
+        super().__init__()
+        self.batch_first  = batch_first
+        self.hidden_size  = hidden_size
+        self.num_layers   = num_layers
+
+        layers = []
+        for l in range(num_layers):
+            in_sz = input_size if l == 0 else hidden_size
+            layers.append(FusedGRULayer(in_sz, hidden_size, bias=bias))
+        self.layers = nn.ModuleList(layers)
+
+    def forward(self, x: torch.Tensor, h0: torch.Tensor):
+        # x shape: (seq, batch, feat) unless batch_first=True
+        if self.batch_first:
+            x = x.transpose(0, 1)           # -> (seq_len, batch, feat)
+
+        seq_len, batch_size, _ = x.size()
+        h_t = list(torch.unbind(h0, dim=0))  # list of (batch, hidden) per layer
+
+        for t in range(seq_len):
+            inp = x[t]
+            for l, layer in enumerate(self.layers):
+                h_new = layer.forward_step(inp, h_t[l])
+                inp   = h_new               # feed to next layer
+                h_t[l] = h_new              # update hidden state
+
+        # Stack final hidden states: shape (num_layers, batch, hidden_size)
+        h_n = torch.stack(h_t, dim=0)
+        return h_n
+```

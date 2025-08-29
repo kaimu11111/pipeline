@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "AdaptiveAvgPool2d(1) replaces required AvgPool2d(7)",
+  "why_it_matters": "Averages over different spatial extent; outputs differ whenever final feature map is not 7×7, violating reference semantics.",
+  "minimal_fix_hint": "Use nn.AvgPool2d(7) before flatten."
+}
+```

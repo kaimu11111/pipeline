@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "SwinMLPBlock defined locally but accessed via ModelNew.SwinMLPBlock",
+  "why_it_matters": "AttributeError is raised while building BasicLayer, so the model cannot be instantiated or run at all.",
+  "minimal_fix_hint": "Reference local SwinMLPBlock or assign it to ModelNew before BasicLayer."
+}
+```

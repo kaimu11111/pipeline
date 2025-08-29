@@ -1,0 +1,146 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# ---------------------------------------------------------------------------
+# Custom CUDA kernel : concatenate two 4-D tensors along channel dimension
+# ---------------------------------------------------------------------------
+cuda_src = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+template <typename scalar_t>
+__global__ void concat_channel_kernel(
+    const scalar_t* __restrict__ a,
+    const scalar_t* __restrict__ b,
+    scalar_t* __restrict__ out,
+    const int64_t n,
+    const int64_t c1,
+    const int64_t c2,
+    const int64_t h,
+    const int64_t w)
+{
+    const int64_t total = n * (c1 + c2) * h * w;
+    const int64_t idx   = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+
+    const int64_t w_idx = idx % w;
+    const int64_t h_idx = (idx / w) % h;
+    const int64_t c_idx = (idx / (w * h)) % (c1 + c2);
+    const int64_t n_idx = idx / ((c1 + c2) * h * w);
+
+    if (c_idx < c1) {
+        const int64_t a_off =
+            ((n_idx * c1 + c_idx) * h + h_idx) * w + w_idx;
+        out[idx] = a[a_off];
+    } else {
+        const int64_t b_c   = c_idx - c1;
+        const int64_t b_off =
+            ((n_idx * c2 + b_c) * h + h_idx) * w + w_idx;
+        out[idx] = b[b_off];
+    }
+}
+
+torch::Tensor concat_channel_cuda(torch::Tensor a, torch::Tensor b) {
+    TORCH_CHECK(a.is_cuda() && b.is_cuda(), "Tensors must be CUDA");
+    TORCH_CHECK(a.dtype() == b.dtype(), "DTypes of a and b must match");
+    TORCH_CHECK(a.dim() == 4 && b.dim() == 4, "Expect 4-D tensors");
+    TORCH_CHECK(a.size(0) == b.size(0) &&
+                a.size(2) == b.size(2) &&
+                a.size(3) == b.size(3), "N, H, W dimensions must match");
+
+    const int64_t n  = a.size(0);
+    const int64_t c1 = a.size(1);
+    const int64_t c2 = b.size(1);
+    const int64_t h  = a.size(2);
+    const int64_t w  = a.size(3);
+
+    auto out = torch::empty({n, c1 + c2, h, w}, a.options());
+
+    const int threads = 256;
+    const int64_t total = n * (c1 + c2) * h * w;
+    const int blocks = (total + threads - 1) / threads;
+
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(a.scalar_type(), "concat_channel", ([&] {
+        concat_channel_kernel<scalar_t><<<blocks, threads>>>(
+            a.data_ptr<scalar_t>(),
+            b.data_ptr<scalar_t>(),
+            out.data_ptr<scalar_t>(),
+            n, c1, c2, h, w);
+    }));
+    return out;
+}
+"""
+
+cpp_decl = "torch::Tensor concat_channel_cuda(torch::Tensor a, torch::Tensor b);"
+
+concat_channel_mod = load_inline(
+    name="concat_channel",
+    cpp_sources=cpp_decl,
+    cuda_sources=cuda_src,
+    functions=["concat_channel_cuda"],
+    verbose=False,
+)
+
+# ---------------------------------------------------------------------------
+# Autograd wrapper
+# ---------------------------------------------------------------------------
+class ConcatChannelFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, a, b):
+        ctx.c1 = a.size(1)
+        ctx.c2 = b.size(1)
+        return concat_channel_mod.concat_channel_cuda(a.contiguous(), b.contiguous())
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        c1, c2 = ctx.c1, ctx.c2
+        grad_a = grad_out[:, :c1, :, :].contiguous()
+        grad_b = grad_out[:, c1:c1 + c2, :, :].contiguous()
+        return grad_a, grad_b
+
+def concat_channel(a, b):
+    return ConcatChannelFunction.apply(a, b)
+
+# ---------------------------------------------------------------------------
+# Optimised Model
+# ---------------------------------------------------------------------------
+class ModelNew(nn.Module):
+    def __init__(self, num_layers: int, num_input_features: int, growth_rate: int):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            self._make_layer(num_input_features + i * growth_rate, growth_rate)
+            for i in range(num_layers)
+        ])
+
+    @staticmethod
+    def _make_layer(in_features: int, growth_rate: int):
+        return nn.Sequential(
+            nn.BatchNorm2d(in_features),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_features, growth_rate, kernel_size=3, padding=1, bias=False),
+            nn.Dropout(0.0),
+        )
+
+    def forward(self, x):
+        for layer in self.layers:
+            new_feat = layer(x)
+            x = concat_channel(x, new_feat)
+        return x
+
+# ---------------------------------------------------------------------------
+# Utility functions (kept identical to original API)
+# ---------------------------------------------------------------------------
+batch_size = 10
+num_layers = 3
+num_input_features = 16
+growth_rate = 16
+height, width = 224, 224
+
+def get_inputs():
+    return [torch.rand(batch_size, num_input_features, height, width).cuda()]
+
+def get_init_inputs():
+    return [num_layers, num_input_features, growth_rate]
+```

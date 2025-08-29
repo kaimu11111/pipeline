@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "drop_path always Identity",
+  "why_it_matters": "Removes stochastic-depth; training-mode outputs and gradients diverge from reference when drop_path_rate>0.",
+  "minimal_fix_hint": "instantiate proper DropPath layer"
+}
+```

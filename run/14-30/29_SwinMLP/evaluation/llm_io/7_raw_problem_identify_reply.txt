@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "DropPath used but reference has none",
+  "why_it_matters": "Candidate’s SwinMLPBlock applies stochastic-depth noise during training, while reference always uses identity, causing large, nondeterministic output mismatches.",
+  "minimal_fix_hint": "replace DropPath with nn.Identity or set drop_prob=0"
+}
+```

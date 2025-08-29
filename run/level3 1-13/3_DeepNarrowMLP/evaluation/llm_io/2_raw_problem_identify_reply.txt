@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Missing `import math`; NameError during weight init",
+  "why_it_matters": "ModelNew fails to construct, so no forward pass can run, giving total mismatch with PyTorch reference.",
+  "minimal_fix_hint": "Add `import math` near other imports"
+}
+```

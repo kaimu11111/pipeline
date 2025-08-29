@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Flatten+linear step replaced by global avg-pool; linear_proj entirely missing",
+  "why_it_matters": "Reference converts 16 patch features (embed_dim*16) to embed_dim; candidate just averages, losing spatial info and altering model behaviour.",
+  "minimal_fix_hint": "Flatten conv output then add nn.Linear(embed_dim*num_patches→embed_dim)"
+}
+```

@@ -1,0 +1,240 @@
+# Copyright 2018 Antoine Miech All Rights Reserved.
+# Optimized with custom CUDA kernels for soft-max and L2-normalisation
+
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+##############################################################################
+#                           CUDA KERNELS                                     #
+##############################################################################
+
+cuda_src = r"""
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <float.h>
+
+// ---------------------------------------------
+// helpers : row-wise reductions inside a block
+// ---------------------------------------------
+template<int BLOCK_SIZE>
+__device__ float block_reduce_max(float v){
+    __shared__ float smem[BLOCK_SIZE];
+    smem[threadIdx.x] = v;
+    __syncthreads();
+    for(int stride = BLOCK_SIZE/2; stride>0; stride >>= 1){
+        if(threadIdx.x < stride){
+            smem[threadIdx.x] = fmaxf(smem[threadIdx.x], smem[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+    return smem[0];
+}
+
+template<int BLOCK_SIZE>
+__device__ float block_reduce_sum(float v){
+    __shared__ float smem[BLOCK_SIZE];
+    smem[threadIdx.x] = v;
+    __syncthreads();
+    for(int stride = BLOCK_SIZE/2; stride>0; stride >>= 1){
+        if(threadIdx.x < stride){
+            smem[threadIdx.x] += smem[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    return smem[0];
+}
+
+// ------------------------------------------------------
+// Row-wise soft-max  (2-D tensor, contiguous) ‑ forward
+// ------------------------------------------------------
+template<int BLOCK_SIZE>
+__global__ void rowwise_softmax_kernel(const float* __restrict__ in,
+                                       float* __restrict__ out,
+                                       const int rows,
+                                       const int cols){
+    int row = blockIdx.x;
+    if(row >= rows) return;
+
+    // compute max per row for numerical stability
+    float local_max = -FLT_MAX;
+    for(int idx = threadIdx.x; idx < cols; idx += BLOCK_SIZE){
+        local_max = fmaxf(local_max, in[row*cols + idx]);
+    }
+    float row_max = block_reduce_max<BLOCK_SIZE>(local_max);
+
+    // exponentiate & accumulate
+    float local_sum = 0.f;
+    for(int idx = threadIdx.x; idx < cols; idx += BLOCK_SIZE){
+        float val = expf(in[row*cols + idx] - row_max);
+        out[row*cols + idx] = val;      // store numerator for now
+        local_sum += val;
+    }
+    float row_sum = block_reduce_sum<BLOCK_SIZE>(local_sum) + 1e-6f; // avoid div by 0
+
+    // normalise
+    for(int idx = threadIdx.x; idx < cols; idx += BLOCK_SIZE){
+        out[row*cols + idx] /= row_sum;
+    }
+}
+
+// ------------------------------------------------------
+// Row-wise L2 normalisation  (2-D tensor, contiguous)
+// ------------------------------------------------------
+template<int BLOCK_SIZE>
+__global__ void rowwise_l2norm_kernel(const float* __restrict__ in,
+                                      float* __restrict__ out,
+                                      const int rows,
+                                      const int cols,
+                                      const float eps){
+    int row = blockIdx.x;
+    if(row >= rows) return;
+
+    // accumulate sum of squares
+    float local_sum = 0.f;
+    for(int idx = threadIdx.x; idx < cols; idx += BLOCK_SIZE){
+        float v = in[row*cols + idx];
+        local_sum += v*v;
+    }
+    float row_sum = block_reduce_sum<BLOCK_SIZE>(local_sum);
+    float inv_norm = rsqrtf(row_sum + eps);
+
+    // write normalised values
+    for(int idx = threadIdx.x; idx < cols; idx += BLOCK_SIZE){
+        out[row*cols + idx] = in[row*cols + idx] * inv_norm;
+    }
+}
+
+// ------------------------------------------------------
+// C++/Python bindings
+// ------------------------------------------------------
+torch::Tensor softmax_rowwise_cuda(torch::Tensor input){
+    TORCH_CHECK(input.is_cuda(), "Input must reside on GPU");
+    TORCH_CHECK(input.dim()==2 && input.is_contiguous(), "Expect contiguous 2-D tensor");
+
+    auto rows = input.size(0);
+    auto cols = input.size(1);
+    auto output = torch::empty_like(input);
+
+    constexpr int BLOCK = 256;
+    rowwise_softmax_kernel<BLOCK><<<rows, BLOCK>>>(input.data_ptr<float>(),
+                                                   output.data_ptr<float>(),
+                                                   rows, cols);
+    return output;
+}
+
+torch::Tensor l2norm_rowwise_cuda(torch::Tensor input, double eps){
+    TORCH_CHECK(input.is_cuda(), "Input must reside on GPU");
+    TORCH_CHECK(input.dim()==2 && input.is_contiguous(), "Expect contiguous 2-D tensor");
+
+    auto rows = input.size(0);
+    auto cols = input.size(1);
+    auto output = torch::empty_like(input);
+
+    constexpr int BLOCK = 256;
+    rowwise_l2norm_kernel<BLOCK><<<rows, BLOCK>>>(input.data_ptr<float>(),
+                                                  output.data_ptr<float>(),
+                                                  rows, cols,
+                                                  static_cast<float>(eps));
+    return output;
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m){
+    m.def("softmax_rowwise_cuda", &softmax_rowwise_cuda, "Row-wise softmax (CUDA)");
+    m.def("l2norm_rowwise_cuda", &l2norm_rowwise_cuda, "Row-wise L2 norm (CUDA)");
+}
+"""
+
+cpp_decls = """
+torch::Tensor softmax_rowwise_cuda(torch::Tensor input);
+torch::Tensor l2norm_rowwise_cuda(torch::Tensor input, double eps);
+"""
+
+ops = load_inline(
+    name="vlad_custom_ops",
+    cpp_sources=cpp_decls,
+    cuda_sources=cuda_src,
+    functions=["softmax_rowwise_cuda", "l2norm_rowwise_cuda"],
+    verbose=False,
+)
+
+##############################################################################
+#                        Optimised Model (ModelNew)                          #
+##############################################################################
+
+class ModelNew(nn.Module):
+    def __init__(self, cluster_size, feature_size, ghost_clusters):
+        super().__init__()
+
+        self.feature_size = feature_size
+        self.cluster_size = cluster_size
+        self.ghost_clusters = ghost_clusters
+
+        init_sc = 1.0 / math.sqrt(feature_size)
+        clusters = cluster_size + ghost_clusters
+
+        self.clusters = nn.Parameter(init_sc * torch.randn(feature_size, clusters))
+        self.batch_norm = nn.BatchNorm1d(clusters)
+        self.clusters2 = nn.Parameter(init_sc * torch.randn(1, feature_size, cluster_size))
+        self.out_dim = self.cluster_size * feature_size
+
+        # expose kernels
+        self.softmax_cuda = ops.softmax_rowwise_cuda
+        self.l2norm_cuda = ops.l2norm_rowwise_cuda
+
+    def forward(self, x, mask=None):
+        """
+        Args:
+            x (Tensor): Shape B x N x D
+        Returns:
+            Tensor: Shape B x (K*D)
+        """
+        B, N, D = x.shape
+        x_flat = x.reshape(-1, self.feature_size)               # BN x D
+
+        assignment = torch.matmul(x_flat, self.clusters)        # BN x (K+G)
+        assignment = self.batch_norm(assignment)
+
+        # --- custom softmax (row-wise on BN x (K+G)) ---
+        assignment = self.softmax_cuda(assignment.contiguous()) # BN x (K+G)
+
+        assignment = assignment[:, :self.cluster_size]          # drop ghost
+        assignment = assignment.view(B, N, self.cluster_size)   # B x N x K
+        a_sum = assignment.sum(dim=1, keepdim=True)             # B x 1 x K
+        a = a_sum * self.clusters2                              # B x D x K
+
+        assignment = assignment.transpose(1, 2)                 # B x K x N
+        x_reshaped = x.reshape(B, N, D)                         # B x N x D
+
+        vlad = torch.matmul(assignment, x_reshaped)             # B x K x D
+        vlad = vlad.transpose(1, 2)                             # B x D x K
+        vlad = vlad - a
+
+        # intra-cluster normalisation (uses native for 3-D tensor)
+        vlad = F.normalize(vlad, p=2, dim=1)
+
+        # flatten
+        vlad = vlad.reshape(B, -1)                              # B x (K*D)
+
+        # --- custom L2 row-wise normalisation (over final feature dim) ---
+        vlad = self.l2norm_cuda(vlad.contiguous(), 1e-12)
+
+        return vlad
+
+##############################################################################
+#                       Helpers for bench / example                          #
+##############################################################################
+batch_size     = 1024
+num_features   = 50
+num_clusters   = 16
+feature_size   = 256
+ghost_clusters = 0
+
+def get_inputs():
+    return [torch.rand(batch_size, num_features, feature_size, device="cuda")]
+
+def get_init_inputs():
+    return [num_clusters, feature_size, ghost_clusters]

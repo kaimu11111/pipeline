@@ -1,0 +1,92 @@
+{
+  "avg_speedup": 0.775455346473589,
+  "accuracy": 0.75,
+  "num_tasks": 12,
+  "tasks": [
+    {
+      "task": "KernelBench/temp/19_MobileNetV1.py",
+      "best_score": 0.0,
+      "best_runnable": false,
+      "task_dir": "/home/wan00559/pipleline/run/20250828_162042_batch_first12/19_MobileNetV1",
+      "figure": "/home/wan00559/pipleline/run/20250828_162042_batch_first12/19_MobileNetV1/figures/19_MobileNetV1_score.png"
+    },
+    {
+      "task": "KernelBench/temp/20_MobileNetV2.py",
+      "best_score": 0.9056749921567987,
+      "best_runnable": true,
+      "task_dir": "/home/wan00559/pipleline/run/20250828_162042_batch_first12/20_MobileNetV2",
+      "figure": "/home/wan00559/pipleline/run/20250828_162042_batch_first12/20_MobileNetV2/figures/20_MobileNetV2_score.png"
+    },
+    {
+      "task": "KernelBench/temp/21_EfficientNetMBConv.py",
+      "best_score": 1.1980420826138654,
+      "best_runnable": true,
+      "task_dir": "/home/wan00559/pipleline/run/20250828_162042_batch_first12/21_EfficientNetMBConv",
+      "figure": "/home/wan00559/pipleline/run/20250828_162042_batch_first12/21_EfficientNetMBConv/figures/21_EfficientNetMBConv_score.png"
+    },
+    {
+      "task": "KernelBench/temp/22_EfficientNetB0.py",
+      "best_score": 0.9176157203869648,
+      "best_runnable": true,
+      "task_dir": "/home/wan00559/pipleline/run/20250828_162042_batch_first12/22_EfficientNetB0",
+      "figure": "/home/wan00559/pipleline/run/20250828_162042_batch_first12/22_EfficientNetB0/figures/22_EfficientNetB0_score.png"
+    },
+    {
+      "task": "KernelBench/temp/23_EfficientNetB1.py",
+      "best_score": 1.4637591669776993,
+      "best_runnable": true,
+      "task_dir": "/home/wan00559/pipleline/run/20250828_162042_batch_first12/23_EfficientNetB1",
+      "figure": "/home/wan00559/pipleline/run/20250828_162042_batch_first12/23_EfficientNetB1/figures/23_EfficientNetB1_score.png"
+    },
+    {
+      "task": "KernelBench/temp/24_EfficientNetB2.py",
+      "best_score": 0.9421253873602121,
+      "best_runnable": true,
+      "task_dir": "/home/wan00559/pipleline/run/20250828_162042_batch_first12/24_EfficientNetB2",
+      "figure": "/home/wan00559/pipleline/run/20250828_162042_batch_first12/24_EfficientNetB2/figures/24_EfficientNetB2_score.png"
+    },
+    {
+      "task": "KernelBench/temp/25_ShuffleNetUnit.py",
+      "best_score": 0.9768215577852783,
+      "best_runnable": true,
+      "task_dir": "/home/wan00559/pipleline/run/20250828_162042_batch_first12/25_ShuffleNetUnit",
+      "figure": "/home/wan00559/pipleline/run/20250828_162042_batch_first12/25_ShuffleNetUnit/figures/25_ShuffleNetUnit_score.png"
+    },
+    {
+      "task": "KernelBench/temp/26_ShuffleNet.py",
+      "best_score": 1.0017720375860695,
+      "best_runnable": true,
+      "task_dir": "/home/wan00559/pipleline/run/20250828_162042_batch_first12/26_ShuffleNet",
+      "figure": "/home/wan00559/pipleline/run/20250828_162042_batch_first12/26_ShuffleNet/figures/26_ShuffleNet_score.png"
+    },
+    {
+      "task": "KernelBench/temp/27_RegNet.py",
+      "best_score": 0.8961114866133124,
+      "best_runnable": true,
+      "task_dir": "/home/wan00559/pipleline/run/20250828_162042_batch_first12/27_RegNet",
+      "figure": "/home/wan00559/pipleline/run/20250828_162042_batch_first12/27_RegNet/figures/27_RegNet_score.png"
+    },
+    {
+      "task": "KernelBench/temp/28_VisionTransformer.py",
+      "best_score": 1.0035417262028694,
+      "best_runnable": true,
+      "task_dir": "/home/wan00559/pipleline/run/20250828_162042_batch_first12/28_VisionTransformer",
+      "figure": "/home/wan00559/pipleline/run/20250828_162042_batch_first12/28_VisionTransformer/figures/28_VisionTransformer_score.png"
+    },
+    {
+      "task": "KernelBench/temp/29_SwinMLP.py",
+      "best_score": 0.0,
+      "best_runnable": false,
+      "task_dir": "/home/wan00559/pipleline/run/20250828_162042_batch_first12/29_SwinMLP",
+      "figure": "/home/wan00559/pipleline/run/20250828_162042_batch_first12/29_SwinMLP/figures/29_SwinMLP_score.png"
+    },
+    {
+      "task": "KernelBench/temp/30_SwinTransformerV2.py",
+      "best_score": 0.0,
+      "best_runnable": false,
+      "task_dir": "/home/wan00559/pipleline/run/20250828_162042_batch_first12/30_SwinTransformerV2",
+      "figure": "/home/wan00559/pipleline/run/20250828_162042_batch_first12/30_SwinTransformerV2/figures/30_SwinTransformerV2_score.png"
+    }
+  ],
+  "timestamp": "2025-08-28 18:33:11"
+}

@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "PatchMerging normalizes before reduction, not after",
+  "why_it_matters": "LayerNorm is applied to 4·dim channels then dropped; 2·dim output remains un-normalized, breaking feature statistics and downstream behavior.",
+  "minimal_fix_hint": "Swap norm and reduction order; norm(2*dim)."
+}
+```

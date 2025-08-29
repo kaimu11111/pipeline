@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Tensor given as 'a' in kaiming_uniform_",
+  "why_it_matters": "kaiming_uniform_ expects a numeric float; tensor input triggers ValueError, so model cannot initialize or run.",
+  "minimal_fix_hint": "use math.sqrt(5.0) or 2.236 as float"
+}
+```

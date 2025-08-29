@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Duplicate PYBIND11_MODULE definition",
+  "why_it_matters": "Causes extension compilation failure; FastReLU6 can’t load, so model cannot execute like reference",
+  "minimal_fix_hint": "Remove redundant PYBIND11_MODULE block"
+}
+```

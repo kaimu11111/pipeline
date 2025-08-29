@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Parameter init order differs from nn.Linear",
+  "why_it_matters": "Drawing random numbers in different order makes all weights/biases differ from reference, giving mismatched forward outputs.",
+  "minimal_fix_hint": "Initialize each layer’s bias right after its weight."
+}
+```

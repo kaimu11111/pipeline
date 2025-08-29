@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Forward enforces CUDA tensors only",
+  "why_it_matters": "get_inputs supplies CPU tensors; TORCH_CHECK in linear_forward_cuda aborts, while reference runs fine on CPU.",
+  "minimal_fix_hint": "Provide CPU implementation or auto-move tensors to CUDA"
+}
+```

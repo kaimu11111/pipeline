@@ -1,0 +1,244 @@
+```python
+# <complete ModelNew code>
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# ----------------------------------------------------------------------
+# CUDA / C++: fused BatchNorm (inference) + Tanh  and  2×2/stride-2 MaxPool
+# ----------------------------------------------------------------------
+cuda_src = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cmath>
+
+/* ----------------  Fused BatchNorm (running stats) + Tanh  ---------------- */
+
+__global__ void bn_tanh_kernel(const float* __restrict__ inp,
+                               const float* __restrict__ weight,
+                               const float* __restrict__ bias,
+                               const float* __restrict__ mean,
+                               const float* __restrict__ var,
+                               float* __restrict__ out,
+                               int N, int C, int H, int W,
+                               float eps)
+{
+    const int total = N * C * H * W;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    while (idx < total) {
+        int w = idx % W;
+        int h = (idx / W) % H;
+        int c = (idx / (W * H)) % C;
+        // int n = idx / (W * H * C);
+
+        float gamma   = weight[c];
+        float beta    = bias[c];
+        float mu      = mean[c];
+        float var_eps = var[c] + eps;
+        float inv_std = rsqrtf(var_eps);
+
+        float val  = inp[idx];
+        float norm = gamma * (val - mu) * inv_std + beta;
+        out[idx]   = tanhf(norm);
+
+        idx += blockDim.x * gridDim.x;
+    }
+}
+
+torch::Tensor bn_tanh_forward_cuda(torch::Tensor input,
+                                   torch::Tensor weight,
+                                   torch::Tensor bias,
+                                   torch::Tensor running_mean,
+                                   torch::Tensor running_var,
+                                   double eps)
+{
+    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
+    TORCH_CHECK(input.scalar_type() == torch::kFloat, "only float32 supported");
+    auto N = input.size(0);
+    auto C = input.size(1);
+    auto H = input.size(2);
+    auto W = input.size(3);
+
+    auto output = torch::empty_like(input);
+
+    const int threads = 256;
+    const int total   = N * C * H * W;
+    const int blocks  = (total + threads - 1) / threads;
+
+    bn_tanh_kernel<<<blocks, threads>>>(input.data_ptr<float>(),
+                                        weight.data_ptr<float>(),
+                                        bias.data_ptr<float>(),
+                                        running_mean.data_ptr<float>(),
+                                        running_var.data_ptr<float>(),
+                                        output.data_ptr<float>(),
+                                        N, C, H, W,
+                                        static_cast<float>(eps));
+    return output;
+}
+
+/* ------------------------- 2×2 / stride-2 MaxPool ------------------------- */
+
+__global__ void maxpool2x2_kernel(const float* __restrict__ inp,
+                                  float* __restrict__ out,
+                                  int N, int C, int H, int W)
+{
+    const int H_out = H >> 1;
+    const int W_out = W >> 1;
+    const int total = N * C * H_out * W_out;
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    while (idx < total) {
+        int w_out = idx % W_out;
+        int h_out = (idx / W_out) % H_out;
+        int c     = (idx / (W_out * H_out)) % C;
+        int n     = idx / (W_out * H_out * C);
+
+        int h_in = h_out << 1;          // *2
+        int w_in = w_out << 1;          // *2
+
+        int base = ((n * C + c) * H + h_in) * W + w_in;
+
+        float m = inp[base];
+        float v1 = inp[base + 1];
+        float v2 = inp[base + W];
+        float v3 = inp[base + W + 1];
+
+        if (v1 > m) m = v1;
+        if (v2 > m) m = v2;
+        if (v3 > m) m = v3;
+
+        out[idx] = m;
+        idx += blockDim.x * gridDim.x;
+    }
+}
+
+torch::Tensor maxpool2x2_cuda(torch::Tensor input)
+{
+    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
+    TORCH_CHECK(input.scalar_type() == torch::kFloat, "only float32 supported");
+    int N = input.size(0);
+    int C = input.size(1);
+    int H = input.size(2);
+    int W = input.size(3);
+
+    TORCH_CHECK(H % 2 == 0 && W % 2 == 0, "H and W must be divisible by 2");
+
+    auto output = torch::empty({N, C, H / 2, W / 2}, input.options());
+
+    const int threads = 256;
+    const int total   = N * C * (H / 2) * (W / 2);
+    const int blocks  = (total + threads - 1) / threads;
+
+    maxpool2x2_kernel<<<blocks, threads>>>(input.data_ptr<float>(),
+                                           output.data_ptr<float>(),
+                                           N, C, H, W);
+    return output;
+}
+"""
+
+cpp_hdr = r"""
+torch::Tensor bn_tanh_forward_cuda(torch::Tensor input,
+                                   torch::Tensor weight,
+                                   torch::Tensor bias,
+                                   torch::Tensor running_mean,
+                                   torch::Tensor running_var,
+                                   double eps);
+torch::Tensor maxpool2x2_cuda(torch::Tensor input);
+"""
+
+# Build/compile the extension
+cuda_kernels = load_inline(
+    name         = "fused_bn_tanh_maxpool",
+    cpp_sources  = cpp_hdr,
+    cuda_sources = cuda_src,
+    functions    = ["bn_tanh_forward_cuda", "maxpool2x2_cuda"],
+    verbose      = False,
+    extra_cuda_cflags=["-O3"],
+    extra_cflags=["-O3"]
+)
+
+# ----------------------------------------------------------------------
+# Python wrappers around the custom kernels
+# ----------------------------------------------------------------------
+class FusedBatchNormTanh(nn.Module):
+    """
+    Inference-time BatchNorm2d fused with Tanh using running statistics.
+    """
+    def __init__(self, num_features, eps=1e-5):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(num_features))
+        self.bias   = nn.Parameter(torch.zeros(num_features))
+        self.register_buffer("running_mean", torch.zeros(num_features))
+        self.register_buffer("running_var",  torch.ones(num_features))
+        self.eps = eps
+
+    def forward(self, x):
+        return cuda_kernels.bn_tanh_forward_cuda(
+            x,
+            self.weight,
+            self.bias,
+            self.running_mean,
+            self.running_var,
+            self.eps
+        )
+
+class MaxPool2x2Stride2(nn.Module):
+    """Custom 2×2/stride-2 max-pool implemented in CUDA."""
+    def forward(self, x):
+        return cuda_kernels.maxpool2x2_cuda(x)
+
+# ----------------------------------------------------------------------
+# New optimised model
+# ----------------------------------------------------------------------
+class ModelNew(nn.Module):
+    """
+    Optimised model using custom CUDA kernels for (BatchNorm + Tanh) and MaxPool.
+    """
+    def __init__(self,
+                 in_channels, out_channels,
+                 kernel_size, stride, padding,
+                 groups, num_groups):
+        super().__init__()
+        self.conv_transpose = nn.ConvTranspose2d(
+            in_channels, out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding
+        )
+
+        # Replace PyTorch BatchNorm + Tanh with fused custom variant
+        self.fused_bn_tanh = FusedBatchNormTanh(out_channels)
+
+        # Our custom 2×2 max-pool
+        self.max_pool = MaxPool2x2Stride2()
+
+        # Keep GroupNorm from PyTorch
+        self.group_norm = nn.GroupNorm(num_groups=num_groups, num_channels=out_channels)
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        x = self.fused_bn_tanh(x)   # fused BatchNorm + Tanh
+        x = self.max_pool(x)        # custom MaxPool
+        x = self.group_norm(x)
+        return x
+
+
+# ----------------------------------------------------------------------
+# Helper functions retained from original spec
+# ----------------------------------------------------------------------
+batch_size   = 256
+in_channels  = 32
+out_channels = 64
+height = width = 32
+kernel_size  = 5
+stride       = 1
+padding      = 1
+groups       = 8
+num_groups   = 8
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width, device="cuda")]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, stride, padding, groups, num_groups]
+```

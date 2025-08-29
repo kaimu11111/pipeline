@@ -1,0 +1,462 @@
+# ----------  Previously generated kernels ----------
+## Existing kernels
+### Kernel 1 · kernel_20250829_100402.py
+```cuda
+# <complete ModelNew code>
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+
+###############################################################################
+# CUDA kernel: (bias + x) * scale followed by sigmoid, NCHW layout
+###############################################################################
+cuda_src = r"""
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+template <typename scalar_t>
+__device__ __forceinline__ scalar_t sigmoidf(scalar_t x) {
+    return static_cast<scalar_t>(1.f) / (static_cast<scalar_t>(1.f) + expf(-x));
+}
+
+template <typename scalar_t>
+__global__ void fused_bias_scale_sigmoid_kernel(
+        const scalar_t* __restrict__ x,
+        const scalar_t* __restrict__ bias,
+        const scalar_t* __restrict__ scale,
+        scalar_t* __restrict__ out,
+        int C, int H, int W, int numel) {
+
+    const int hw = H * W;
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+         idx < numel;
+         idx += blockDim.x * gridDim.x) {
+
+        // Recover channel index from flattened idx (NCHW layout)
+        int c = (idx / hw) % C;
+        scalar_t val = x[idx];
+        val = (val + bias[c]) * scale[c];
+        out[idx] = sigmoidf(val);
+    }
+}
+
+torch::Tensor fused_bias_scale_sigmoid_cuda(torch::Tensor x,
+                                            torch::Tensor bias,
+                                            torch::Tensor scale) {
+    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
+    TORCH_CHECK(bias.is_cuda(), "Bias must be a CUDA tensor");
+    TORCH_CHECK(scale.is_cuda(), "Scale must be a CUDA tensor");
+    TORCH_CHECK(x.dtype() == torch::kFloat32, "Only float32 supported");
+
+    auto N = x.size(0);
+    auto C = x.size(1);
+    auto H = x.size(2);
+    auto W = x.size(3);
+    auto numel = x.numel();
+
+    auto out = torch::empty_like(x);
+
+    const int threads = 256;
+    const int blocks = (numel + threads - 1) / threads;
+
+    fused_bias_scale_sigmoid_kernel<float><<<blocks, threads>>>(
+        x.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        scale.data_ptr<float>(),
+        out.data_ptr<float>(),
+        C, H, W, numel);
+
+    return out;
+}
+"""
+
+cpp_decls = """
+torch::Tensor fused_bias_scale_sigmoid_cuda(torch::Tensor x,
+                                            torch::Tensor bias,
+                                            torch::Tensor scale);
+"""
+
+# Compile & load the CUDA extension
+fused_bias_scale_sigmoid = load_inline(
+    name="fused_bias_scale_sigmoid",
+    cpp_sources=cpp_decls,
+    cuda_sources=cuda_src,
+    functions=["fused_bias_scale_sigmoid_cuda"],
+    verbose=False,
+)
+
+###############################################################################
+# Optimised model using the custom kernel
+###############################################################################
+class ModelNew(nn.Module):
+    """
+    Optimised model: convolution -> fused (bias + scale + sigmoid) CUDA kernel
+    -> group normalization
+    """
+    def __init__(self,
+                 in_channels,
+                 out_channels,
+                 kernel_size,
+                 num_groups,
+                 bias_shape,
+                 scale_shape):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, padding=kernel_size//2)
+        # register parameters the same way as the original model
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.scale = nn.Parameter(torch.randn(scale_shape))
+        self.group_norm = nn.GroupNorm(num_groups, out_channels)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = fused_bias_scale_sigmoid.fused_bias_scale_sigmoid_cuda(
+            x,
+            self.bias,
+            self.scale
+        )
+        x = self.group_norm(x)
+        return x
+
+
+###############################################################################
+# Helper functions (unchanged)
+###############################################################################
+batch_size = 64
+in_channels = 4
+out_channels = 16
+height = width = 128
+kernel_size = 3
+num_groups = 8
+bias_shape = (out_channels, 1, 1)
+scale_shape = (out_channels, 1, 1)
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width, device="cuda")]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, num_groups, bias_shape, scale_shape]
+# </complete ModelNew code>
+```
+
+### Kernel 2 · kernel_20250829_100618.py
+```cuda
+# <complete ModelNew code>
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+
+###############################################################################
+# CUDA kernel + host wrapper
+###############################################################################
+source = r"""
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+template <typename scalar_t>
+__device__ __forceinline__ scalar_t sigmoidf(scalar_t x) {
+    return static_cast<scalar_t>(1.f) / (static_cast<scalar_t>(1.f) + expf(-x));
+}
+
+template <typename scalar_t>
+__global__ void fused_bias_scale_sigmoid_kernel(
+        const scalar_t* __restrict__ x,
+        const scalar_t* __restrict__ bias,
+        const scalar_t* __restrict__ scale,
+        scalar_t* __restrict__ out,
+        int C, int H, int W, int numel) {
+
+    const int hw = H * W;
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+         idx < numel;
+         idx += blockDim.x * gridDim.x) {
+
+        int c = (idx / hw) % C;              // channel index (NCHW)
+        scalar_t v = (x[idx] + bias[c]) * scale[c];
+        out[idx]  = sigmoidf(v);
+    }
+}
+
+torch::Tensor fused_bias_scale_sigmoid_cuda(
+        torch::Tensor x,
+        torch::Tensor bias,
+        torch::Tensor scale) {
+
+    TORCH_CHECK(x.is_cuda(),    "x must be CUDA");
+    TORCH_CHECK(bias.is_cuda(), "bias must be CUDA");
+    TORCH_CHECK(scale.is_cuda(),"scale must be CUDA");
+    TORCH_CHECK(x.dtype() == torch::kFloat32, "only float32 supported");
+
+    const int C = x.size(1);
+    const int H = x.size(2);
+    const int W = x.size(3);
+    const int numel = x.numel();
+
+    auto out = torch::empty_like(x);
+
+    const int threads = 256;
+    const int blocks  = (numel + threads - 1) / threads;
+
+    fused_bias_scale_sigmoid_kernel<float><<<blocks, threads>>>(
+        x.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        scale.data_ptr<float>(),
+        out.data_ptr<float>(),
+        C, H, W, numel
+    );
+    return out;
+}
+"""
+
+###############################################################################
+# C++ prototypes
+###############################################################################
+cpp_src = r"""
+torch::Tensor fused_bias_scale_sigmoid_cuda(torch::Tensor x,
+                                            torch::Tensor bias,
+                                            torch::Tensor scale);
+"""
+
+###############################################################################
+# Build & load extension
+###############################################################################
+fused_bias_scale_sigmoid = load_inline(
+    name        = "fused_bias_scale_sigmoid",
+    cpp_sources = cpp_src,
+    cuda_sources= source,
+    functions   = ["fused_bias_scale_sigmoid_cuda"],
+    verbose     = False,
+)
+
+
+###############################################################################
+# PyTorch module that uses the custom CUDA kernel
+###############################################################################
+class ModelNew(nn.Module):
+    """
+    Optimised model: Conv2d (no padding) -> fused (bias+scale+sigmoid) kernel
+    -> GroupNorm
+    """
+    def __init__(self,
+                 in_channels,
+                 out_channels,
+                 kernel_size,
+                 num_groups,
+                 bias_shape,
+                 scale_shape):
+        super().__init__()
+        # Critical fix: remove padding so spatial dims match reference (126×126)
+        self.conv = nn.Conv2d(in_channels,
+                              out_channels,
+                              kernel_size,
+                              padding=0)
+
+        self.bias  = nn.Parameter(torch.randn(bias_shape))
+        self.scale = nn.Parameter(torch.randn(scale_shape))
+        self.group_norm = nn.GroupNorm(num_groups, out_channels)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = fused_bias_scale_sigmoid.fused_bias_scale_sigmoid_cuda(
+            x, self.bias, self.scale)
+        x = self.group_norm(x)
+        return x
+
+
+###############################################################################
+# Helper functions expected by the harness
+###############################################################################
+batch_size  = 64
+in_channels = 4
+out_channels= 16
+height = width = 128
+kernel_size = 3
+num_groups  = 8
+bias_shape  = (out_channels, 1, 1)
+scale_shape = (out_channels, 1, 1)
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width, device="cuda")]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, num_groups,
+            bias_shape, scale_shape]
+# </complete ModelNew code>
+```
+
+
+You are a CUDA-kernel optimization specialist.
+
+Analyze the provided architecture and kernel history to produce an improved CUDA kernel.
+
+[ARCHITECTURE FILE]
+```python
+# <complete ModelNew code>
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+
+###############################################################################
+# CUDA kernel + host wrapper
+###############################################################################
+source = r"""
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+template <typename scalar_t>
+__device__ __forceinline__ scalar_t sigmoidf(scalar_t x) {
+    return static_cast<scalar_t>(1.f) / (static_cast<scalar_t>(1.f) + expf(-x));
+}
+
+template <typename scalar_t>
+__global__ void fused_bias_scale_sigmoid_kernel(
+        const scalar_t* __restrict__ x,
+        const scalar_t* __restrict__ bias,
+        const scalar_t* __restrict__ scale,
+        scalar_t* __restrict__ out,
+        int C, int H, int W, int numel) {
+
+    const int hw = H * W;
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+         idx < numel;
+         idx += blockDim.x * gridDim.x) {
+
+        int c = (idx / hw) % C;              // channel index (NCHW)
+        scalar_t v = (x[idx] + bias[c]) * scale[c];
+        out[idx]  = sigmoidf(v);
+    }
+}
+
+torch::Tensor fused_bias_scale_sigmoid_cuda(
+        torch::Tensor x,
+        torch::Tensor bias,
+        torch::Tensor scale) {
+
+    TORCH_CHECK(x.is_cuda(),    "x must be CUDA");
+    TORCH_CHECK(bias.is_cuda(), "bias must be CUDA");
+    TORCH_CHECK(scale.is_cuda(),"scale must be CUDA");
+    TORCH_CHECK(x.dtype() == torch::kFloat32, "only float32 supported");
+
+    const int C = x.size(1);
+    const int H = x.size(2);
+    const int W = x.size(3);
+    const int numel = x.numel();
+
+    auto out = torch::empty_like(x);
+
+    const int threads = 256;
+    const int blocks  = (numel + threads - 1) / threads;
+
+    fused_bias_scale_sigmoid_kernel<float><<<blocks, threads>>>(
+        x.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        scale.data_ptr<float>(),
+        out.data_ptr<float>(),
+        C, H, W, numel
+    );
+    return out;
+}
+"""
+
+###############################################################################
+# C++ prototypes
+###############################################################################
+cpp_src = r"""
+torch::Tensor fused_bias_scale_sigmoid_cuda(torch::Tensor x,
+                                            torch::Tensor bias,
+                                            torch::Tensor scale);
+"""
+
+###############################################################################
+# Build & load extension
+###############################################################################
+fused_bias_scale_sigmoid = load_inline(
+    name        = "fused_bias_scale_sigmoid",
+    cpp_sources = cpp_src,
+    cuda_sources= source,
+    functions   = ["fused_bias_scale_sigmoid_cuda"],
+    verbose     = False,
+)
+
+
+###############################################################################
+# PyTorch module that uses the custom CUDA kernel
+###############################################################################
+class ModelNew(nn.Module):
+    """
+    Optimised model: Conv2d (no padding) -> fused (bias+scale+sigmoid) kernel
+    -> GroupNorm
+    """
+    def __init__(self,
+                 in_channels,
+                 out_channels,
+                 kernel_size,
+                 num_groups,
+                 bias_shape,
+                 scale_shape):
+        super().__init__()
+        # Critical fix: remove padding so spatial dims match reference (126×126)
+        self.conv = nn.Conv2d(in_channels,
+                              out_channels,
+                              kernel_size,
+                              padding=0)
+
+        self.bias  = nn.Parameter(torch.randn(bias_shape))
+        self.scale = nn.Parameter(torch.randn(scale_shape))
+        self.group_norm = nn.GroupNorm(num_groups, out_channels)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = fused_bias_scale_sigmoid.fused_bias_scale_sigmoid_cuda(
+            x, self.bias, self.scale)
+        x = self.group_norm(x)
+        return x
+
+
+###############################################################################
+# Helper functions expected by the harness
+###############################################################################
+batch_size  = 64
+in_channels = 4
+out_channels= 16
+height = width = 128
+kernel_size = 3
+num_groups  = 8
+bias_shape  = (out_channels, 1, 1)
+scale_shape = (out_channels, 1, 1)
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width, device="cuda")]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, num_groups,
+            bias_shape, scale_shape]
+# </complete ModelNew code>
+```
+
+GOAL
+────
+- Improve latency and throughput on the target GPU.
+- Maintain correctness within atol=1e-4 or rtol=1e-4.
+- Preserve the public Python API (same inputs/outputs, shapes, dtypes).
+
+
+OUTPUT RULES (STRICT) ────────────────────────────────────────────────
+1. Inside the block, follow **exactly** this order:
+   1. Imports – `torch`, `torch.nn`, `load_inline`.
+   2. `source` – triple‑quoted CUDA string(s) (kernel + host wrapper).
+   3. `cpp_src` – prototypes for *all* kernels you expose.
+   4. **One** `load_inline` call per kernel group.
+   5. `class ModelNew(nn.Module)` – mirrors original inputs/outputs but calls
+      your CUDA kernels.
+2. **Do NOT include** testing code, `if __name__ == "__main__"`, or extra prose.
+
+```python
+# <your corrected code>
+```
+# ==========================================================

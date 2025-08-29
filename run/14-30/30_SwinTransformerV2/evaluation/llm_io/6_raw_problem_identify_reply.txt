@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "PatchEmbed uses patch_size=2 (img_size=112) not 4 (224)",
+  "why_it_matters": "Alters patch count, layer dimensions and weights, so every subsequent tensor shape and output diverges from reference model.",
+  "minimal_fix_hint": "Match reference: patch_size=4, img_size=224"
+}
+```

@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "PatchEmbed ignores configured img_size",
+  "why_it_matters": "It accepts any H,W divisible by patch_size but layers use init-time 224-based resolutions, so token counts mismatch and SwinMLP blocks assert/ malfunction.",
+  "minimal_fix_hint": "Re-enforce H,W == self.img_size in PatchEmbed."
+}
+```

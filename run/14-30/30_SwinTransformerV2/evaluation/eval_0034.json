@@ -1,0 +1,6 @@
+{
+  "runnable": false,
+  "phase": "repair",
+  "error_type": "RuntimeError",
+  "message": "Traceback (most recent call last):\n  File \"/home/wan00559/pipleline/utils/compile_and_run.py\", line 516, in compare_and_bench\n    test_model = ModelNew(*init_args, **init_kwargs)\n                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/wan00559/pipleline/run/20250828_162042_batch_first12/30_SwinTransformerV2/code/kernel_20250828_180809.py\", line 68, in __init__\n    self.patch_embed = PatchEmbed(\n                       ^^^^^^^^^^\nNameError: name 'PatchEmbed' is not defined\n"
+}

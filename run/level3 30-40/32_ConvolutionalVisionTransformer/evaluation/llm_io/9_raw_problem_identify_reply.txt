@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Patch embedding strategy differs; candidate feeds 17 tokens vs. reference 2 tokens",
+  "why_it_matters": "Unfold+per-patch linear changes sequence length and semantics, so transformer receives incompatible data and outputs diverge drastically.",
+  "minimal_fix_hint": "Use conv2d+flatten then single linear to produce one token"
+}
+```

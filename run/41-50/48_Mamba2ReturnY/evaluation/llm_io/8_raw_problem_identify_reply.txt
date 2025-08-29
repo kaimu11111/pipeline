@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "segsum_exp returns inclusive sums; reference needs exclusive (diag=0).",
+  "why_it_matters": "Diagonal entries become exp(A_i) instead of 1, drastically inflating L and decay factors, causing huge output errors.",
+  "minimal_fix_hint": "subtract A_j (or start k=j+1) when accumulating in kernel."
+}
+```

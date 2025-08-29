@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "ReLU moved after 1×1 conv inside CUDA kernel",
+  "why_it_matters": "Reference path is BN→ReLU→Conv; candidate is BN→Conv→ReLU, fundamentally changing non-linearity placement and hence all outputs/gradients.",
+  "minimal_fix_hint": "apply ReLU before conv or drop fused ReLU"
+}
+```

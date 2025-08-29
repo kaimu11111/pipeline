@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Y_diag einsum uses \"bhcll\" (diag) instead of separate l,s axes",
+  "why_it_matters": "Collapses required summation over prior positions; only diagonal of L is used, producing large output mismatch.",
+  "minimal_fix_hint": "change to \"bclhn,bcshn,bhcls,bcshp->bclhp\""
+}
+```

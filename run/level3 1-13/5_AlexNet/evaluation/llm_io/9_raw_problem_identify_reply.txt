@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "fc1 uses 256*2*2 instead of 256*6*6 flattened features",
+  "why_it_matters": "Wrong in_features alters weight dimensions, changing network topology and producing outputs incomparable with reference architecture.",
+  "minimal_fix_hint": "set fc1 in_features to 9216"
+}
+```

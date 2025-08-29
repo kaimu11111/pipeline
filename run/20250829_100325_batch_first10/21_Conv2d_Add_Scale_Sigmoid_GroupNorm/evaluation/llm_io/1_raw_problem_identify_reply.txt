@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Convolution is padded (padding=1) instead of no padding",
+  "why_it_matters": "Extra padding keeps feature maps 128×128 vs reference’s 126×126, causing shape and value mismatches downstream",
+  "minimal_fix_hint": "Instantiate nn.Conv2d without padding"
+}
+```

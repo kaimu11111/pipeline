@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "fc1 declared 9216 in_features but flatten gives 1024",
+  "why_it_matters": "Input 112×112 yields 2×2 maps; matmul dims mismatch raises runtime error, model never produces outputs.",
+  "minimal_fix_hint": "change fc1 to 256*2*2=1024"
+}
+```

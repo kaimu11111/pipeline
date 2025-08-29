@@ -1,0 +1,16 @@
+task,best_score,best_runnable,task_dir,figure
+KernelBench/temp/19_MobileNetV1.py,0.000000,0,/home/wan00559/pipleline/run/20250828_162042_batch_first12/19_MobileNetV1,/home/wan00559/pipleline/run/20250828_162042_batch_first12/19_MobileNetV1/figures/19_MobileNetV1_score.png
+KernelBench/temp/20_MobileNetV2.py,0.905675,1,/home/wan00559/pipleline/run/20250828_162042_batch_first12/20_MobileNetV2,/home/wan00559/pipleline/run/20250828_162042_batch_first12/20_MobileNetV2/figures/20_MobileNetV2_score.png
+KernelBench/temp/21_EfficientNetMBConv.py,1.198042,1,/home/wan00559/pipleline/run/20250828_162042_batch_first12/21_EfficientNetMBConv,/home/wan00559/pipleline/run/20250828_162042_batch_first12/21_EfficientNetMBConv/figures/21_EfficientNetMBConv_score.png
+KernelBench/temp/22_EfficientNetB0.py,0.917616,1,/home/wan00559/pipleline/run/20250828_162042_batch_first12/22_EfficientNetB0,/home/wan00559/pipleline/run/20250828_162042_batch_first12/22_EfficientNetB0/figures/22_EfficientNetB0_score.png
+KernelBench/temp/23_EfficientNetB1.py,1.463759,1,/home/wan00559/pipleline/run/20250828_162042_batch_first12/23_EfficientNetB1,/home/wan00559/pipleline/run/20250828_162042_batch_first12/23_EfficientNetB1/figures/23_EfficientNetB1_score.png
+KernelBench/temp/24_EfficientNetB2.py,0.942125,1,/home/wan00559/pipleline/run/20250828_162042_batch_first12/24_EfficientNetB2,/home/wan00559/pipleline/run/20250828_162042_batch_first12/24_EfficientNetB2/figures/24_EfficientNetB2_score.png
+KernelBench/temp/25_ShuffleNetUnit.py,0.976822,1,/home/wan00559/pipleline/run/20250828_162042_batch_first12/25_ShuffleNetUnit,/home/wan00559/pipleline/run/20250828_162042_batch_first12/25_ShuffleNetUnit/figures/25_ShuffleNetUnit_score.png
+KernelBench/temp/26_ShuffleNet.py,1.001772,1,/home/wan00559/pipleline/run/20250828_162042_batch_first12/26_ShuffleNet,/home/wan00559/pipleline/run/20250828_162042_batch_first12/26_ShuffleNet/figures/26_ShuffleNet_score.png
+KernelBench/temp/27_RegNet.py,0.896111,1,/home/wan00559/pipleline/run/20250828_162042_batch_first12/27_RegNet,/home/wan00559/pipleline/run/20250828_162042_batch_first12/27_RegNet/figures/27_RegNet_score.png
+KernelBench/temp/28_VisionTransformer.py,1.003542,1,/home/wan00559/pipleline/run/20250828_162042_batch_first12/28_VisionTransformer,/home/wan00559/pipleline/run/20250828_162042_batch_first12/28_VisionTransformer/figures/28_VisionTransformer_score.png
+KernelBench/temp/29_SwinMLP.py,0.000000,0,/home/wan00559/pipleline/run/20250828_162042_batch_first12/29_SwinMLP,/home/wan00559/pipleline/run/20250828_162042_batch_first12/29_SwinMLP/figures/29_SwinMLP_score.png
+KernelBench/temp/30_SwinTransformerV2.py,0.000000,0,/home/wan00559/pipleline/run/20250828_162042_batch_first12/30_SwinTransformerV2,/home/wan00559/pipleline/run/20250828_162042_batch_first12/30_SwinTransformerV2/figures/30_SwinTransformerV2_score.png
+
+avg_speedup,0.775455
+accuracy,0.750000

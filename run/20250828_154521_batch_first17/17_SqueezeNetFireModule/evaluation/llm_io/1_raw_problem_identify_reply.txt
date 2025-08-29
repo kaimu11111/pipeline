@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "1×1 conv parameters are freshly re-initialized, not matched to reference Conv2d weights/biases",
+  "why_it_matters": "Different random weights cause up to ~0.5 output error; math is fine but model parameters don’t correspond to reference.",
+  "minimal_fix_hint": "Create 1×1 layers via nn.Conv2d or copy reference state_dict."
+}
+```

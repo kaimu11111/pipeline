@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Model/input size hard-coded to 112 not 224",
+  "why_it_matters": "Generated 112×112 images violate reference PatchEmbed assertion (expects 224×224), so reference crashes before comparison.",
+  "minimal_fix_hint": "Use 224 for img_size in get_inputs and ModelNew"
+}
+```

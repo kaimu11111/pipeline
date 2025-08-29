@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "fc1 expects 9216 inputs but conv output is 1024",
+  "why_it_matters": "Matmul shapes (batch×1024 vs 9216×4096) mismatch, raising runtime error so model never produces outputs to compare.",
+  "minimal_fix_hint": "change fc1 in_features to 256*2*2"
+}
+```

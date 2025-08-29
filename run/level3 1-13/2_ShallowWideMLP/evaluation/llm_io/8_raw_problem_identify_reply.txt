@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "No correctness issue found",
+  "why_it_matters": "Candidate implementation matches reference functionality; no behavioral mismatch detected.",
+  "minimal_fix_hint": "No fix necessary"
+}
+```

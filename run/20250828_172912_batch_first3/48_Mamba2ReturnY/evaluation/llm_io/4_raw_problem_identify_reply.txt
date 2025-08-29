@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "segsum_exp off-by-one: sums j..i-1, should sum j+1..i",
+  "why_it_matters": "Each weight L[b,h,c,i,j] is shifted by one element (uses A_j instead of A_i), propagating wrong exponents and exploding output errors (~1e9).",
+  "minimal_fix_hint": "change loop to for(int k=j+1;k<=i;++k)"
+}
+```

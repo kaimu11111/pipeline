@@ -31,10 +31,10 @@ class Model(nn.Module):
         return self.network(x)
 
 # Test code
-batch_size = 128
-input_size = 16384
-hidden_layer_sizes = [32768, 32768]
-output_size = 16384
+batch_size = 64
+input_size = 8192
+hidden_layer_sizes = [8192, 8192]
+output_size = 4096
 
 def get_inputs():
     return [torch.rand(batch_size, input_size)]

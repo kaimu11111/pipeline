@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "cuda_source includes its own PYBIND11_MODULE",
+  "why_it_matters": "load_inline auto-creates a module; the extra definition causes duplicate PyInit_window_ops symbol and compilation fails, so custom CUDA ops never run.",
+  "minimal_fix_hint": "Delete PYBIND11_MODULE block in cuda_source"
+}
+```

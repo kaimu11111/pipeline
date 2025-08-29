@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "ModelNew.Mlp attribute missing; inner Mlp scoped only inside __init__",
+  "why_it_matters": "SwinMLPBlock tries to call ModelNew.Mlp, raising AttributeError, so model cannot be constructed or run.",
+  "minimal_fix_hint": "Declare Mlp at class level or set ModelNew.Mlp = Mlp."
+}
+```

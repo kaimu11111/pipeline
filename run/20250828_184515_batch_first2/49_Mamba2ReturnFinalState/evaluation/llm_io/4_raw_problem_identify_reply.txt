@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Kernel uses fast-math __expf approximation",
+  "why_it_matters": "__expf can err >0.1 %, so large exp outputs diverge beyond atol/rtol, giving multi-million output error.",
+  "minimal_fix_hint": "switch to precise expf() / std::exp"
+}
+```

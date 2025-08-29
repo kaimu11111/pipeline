@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "B tensor mis-indexed in Y_diag einsum",
+  "why_it_matters": "Using \"bclhn\" instead of \"bcshn\" aligns B’s length with C’s, not L/X’s, yielding wrong block products and huge output errors.",
+  "minimal_fix_hint": "permute B to bcshn and use \"bcshn\" in einsum"
+}
+```

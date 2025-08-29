@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "get_inputs uses 224×224 instead of 112×112",
+  "why_it_matters": "Reference model expects 112×112; size mismatch triggers assertion, preventing any output comparison.",
+  "minimal_fix_hint": "Change image_size in get_inputs to 112"
+}
+```

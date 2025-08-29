@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "cuda_src re-defines PYBIND11_MODULE causing duplicate symbol",
+  "why_it_matters": "Two PyInit_fused_bn_relu definitions make the extension fail to link, so the fused kernel never builds and model breaks.",
+  "minimal_fix_hint": "Delete the manual PYBIND11_MODULE block."
+}
+```

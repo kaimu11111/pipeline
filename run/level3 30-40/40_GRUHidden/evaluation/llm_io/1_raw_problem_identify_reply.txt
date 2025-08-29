@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "ModelNew uses its own freshly-initialized weights",
+  "why_it_matters": "Parameters differ from the reference nn.GRU, so even with a correct update rule the produced h_n is unrelated, giving large output error.",
+  "minimal_fix_hint": "Load/copy GRU state_dict into custom layer matrices."
+}
+```

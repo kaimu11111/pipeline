@@ -1,0 +1,180 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# ------------------------------------------------------------------
+# CUDA implementation of the ChannelShuffle operation
+# ------------------------------------------------------------------
+
+cuda_source = r"""
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+template <typename scalar_t>
+__global__ void channel_shuffle_kernel(
+        const scalar_t* __restrict__ input,
+        scalar_t* __restrict__ output,
+        const int B, const int C, const int H, const int W,
+        const int groups) {
+
+    const int channels_per_group = C / groups;
+    const int total_elem = B * C * H * W;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    for (int i = idx; i < total_elem; i += blockDim.x * gridDim.x) {
+        int w = i % W;
+        int tmp = i / W;
+        int h = tmp % H;
+        tmp /= H;
+        int c = tmp % C;
+        int b = tmp / C;
+
+        int g = c / channels_per_group;    // which group
+        int k = c % channels_per_group;    // index inside the group
+        int new_c = k * groups + g;        // transposed position
+
+        int out_idx = (((b * C + new_c) * H + h) * W + w);
+        output[out_idx] = input[i];
+    }
+}
+
+torch::Tensor channel_shuffle_cuda(torch::Tensor x, int groups) {
+    TORCH_CHECK(x.is_cuda(), "input must be a CUDA tensor");
+    TORCH_CHECK(x.dim() == 4, "input must be 4-D");
+    TORCH_CHECK(x.size(1) % groups == 0, "channels must be divisible by groups");
+
+    const int B = x.size(0);
+    const int C = x.size(1);
+    const int H = x.size(2);
+    const int W = x.size(3);
+
+    auto y = torch::empty_like(x);
+
+    const int threads = 256;
+    const int total_elem = B * C * H * W;
+    const int blocks = (total_elem + threads - 1) / threads;
+
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(x.scalar_type(), "channel_shuffle_cuda", ([&] {
+        channel_shuffle_kernel<scalar_t><<<blocks, threads>>>(
+            x.data_ptr<scalar_t>(),
+            y.data_ptr<scalar_t>(),
+            B, C, H, W, groups);
+    }));
+
+    return y;
+}
+"""
+
+cpp_decls = """
+torch::Tensor channel_shuffle_cuda(torch::Tensor x, int groups);
+"""
+
+_channel_shuffle = load_inline(
+    name="channel_shuffle_cuda_ext",
+    cpp_sources=cpp_decls,
+    cuda_sources=cuda_source,
+    functions=["channel_shuffle_cuda"],
+    verbose=False,
+)
+
+# ------------------------------------------------------------------
+# Python modules that use the CUDA implementation
+# ------------------------------------------------------------------
+
+class ChannelShuffleCUDA(nn.Module):
+    def __init__(self, groups: int):
+        super().__init__()
+        self.groups = groups
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not x.is_cuda:
+            # Fallback to PyTorch implementation on CPU tensors
+            b, c, h, w = x.size()
+            channels_per_group = c // self.groups
+            x = x.view(b, self.groups, channels_per_group, h, w)
+            x = x.transpose(1, 2).contiguous()
+            return x.view(b, c, h, w)
+        return _channel_shuffle.channel_shuffle_cuda(x, self.groups)
+
+# ------------------------------------------------------------------
+# Architectural definition with the optimized ChannelShuffleCUDA
+# ------------------------------------------------------------------
+
+class ShuffleNetUnit(nn.Module):
+    def __init__(self, in_channels, out_channels, groups=3):
+        super().__init__()
+        assert out_channels % 4 == 0
+        mid_channels = out_channels // 4
+
+        self.conv1 = nn.Conv2d(in_channels, mid_channels, 1, 1, 0, groups=groups, bias=False)
+        self.bn1   = nn.BatchNorm2d(mid_channels)
+
+        self.conv2 = nn.Conv2d(mid_channels, mid_channels, 3, 1, 1, groups=mid_channels, bias=False)
+        self.bn2   = nn.BatchNorm2d(mid_channels)
+
+        self.conv3 = nn.Conv2d(mid_channels, out_channels, 1, 1, 0, groups=groups, bias=False)
+        self.bn3   = nn.BatchNorm2d(out_channels)
+
+        self.shuffle = ChannelShuffleCUDA(groups)
+
+        if in_channels == out_channels:
+            self.shortcut = nn.Identity()
+        else:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, 1, 1, 0, bias=False),
+                nn.BatchNorm2d(out_channels),
+            )
+
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)), inplace=True)
+        out = self.bn2(self.conv2(out))
+        out = self.shuffle(out)
+        out = F.relu(self.bn3(self.conv3(out)), inplace=True)
+        out = out + self.shortcut(x)
+        return out
+
+class ModelNew(nn.Module):
+    def __init__(
+        self,
+        num_classes=1000,
+        groups=3,
+        stages_repeats=(3, 7, 3),
+        stages_out_channels=(24, 240, 480, 960),
+    ):
+        super().__init__()
+
+        self.conv1 = nn.Conv2d(3, stages_out_channels[0], 3, 2, 1, bias=False)
+        self.bn1   = nn.BatchNorm2d(stages_out_channels[0])
+        self.maxpool = nn.MaxPool2d(3, 2, 1)
+
+        self.stage2 = self._make_stage(stages_out_channels[0], stages_out_channels[1],
+                                       stages_repeats[0], groups)
+        self.stage3 = self._make_stage(stages_out_channels[1], stages_out_channels[2],
+                                       stages_repeats[1], groups)
+        self.stage4 = self._make_stage(stages_out_channels[2], stages_out_channels[3],
+                                       stages_repeats[2], groups)
+
+        self.conv5 = nn.Conv2d(stages_out_channels[3], 1024, 1, 1, 0, bias=False)
+        self.bn5   = nn.BatchNorm2d(1024)
+        self.fc    = nn.Linear(1024, num_classes)
+
+    def _make_stage(self, in_channels, out_channels, repeats, groups):
+        layers = [ShuffleNetUnit(in_channels, out_channels, groups)]
+        for _ in range(1, repeats):
+            layers.append(ShuffleNetUnit(out_channels, out_channels, groups))
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        x = F.relu(self.bn1(self.conv1(x)), inplace=True)
+        x = self.maxpool(x)
+
+        x = self.stage2(x)
+        x = self.stage3(x)
+        x = self.stage4(x)
+
+        x = F.relu(self.bn5(self.conv5(x)), inplace=True)
+        x = F.adaptive_avg_pool2d(x, (1, 1)).flatten(1)
+        x = self.fc(x)
+        return x

@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Function name mismatch in load_inline functions list",
+  "why_it_matters": "load_inline looks for linear_bias_relu_forward/linear_bias_forward but only *_cuda variants exist, so compilation stops and model cannot run.",
+  "minimal_fix_hint": "Expose non-suffixed wrappers or list *_cuda names."
+}
+```

@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "segsum_exp leaves upper-triangular as 0 not ‑inf",
+  "why_it_matters": "Reference masks upper-triangular with ‑inf then exponentiates; early exponentiation needs zeroed weights but gradients differ, large forward mismatch appears.",
+  "minimal_fix_hint": "write –inf to upper-triangular before exp"
+}
+```

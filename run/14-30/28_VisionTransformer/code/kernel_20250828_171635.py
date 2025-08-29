@@ -1,0 +1,232 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# ------------------------------------------------------------------------
+# CUDA kernels (patch extraction + positional embedding addition)
+# ------------------------------------------------------------------------
+cuda_source = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <vector>
+
+/* --------------------------------------------------------------------- */
+/* Patch extraction kernel                                               */
+/* --------------------------------------------------------------------- */
+template <typename scalar_t>
+__global__ void extract_patches_kernel(
+    const scalar_t* __restrict__ img,
+    scalar_t* __restrict__ patches,
+    int B, int C, int H, int W,
+    int p, int num_patches_h, int num_patches_w)
+{
+    const int patch_dim = C * p * p;
+    const long total_elements = (long)B * num_patches_h * num_patches_w * patch_dim;
+
+    long idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_elements) return;
+
+    long inside_patch = idx % patch_dim;                           // 0 .. patch_dim-1
+    long patch_linear = idx / patch_dim;                           // 0 .. B*num_patches-1
+
+    int pw = patch_linear % num_patches_w;                         // patch column
+    int ph = (patch_linear / num_patches_w) % num_patches_h;       // patch row
+    int b  = patch_linear / (num_patches_w * num_patches_h);       // batch
+
+    int ij = inside_patch % (p * p);                               // 0 .. p*p-1
+    int c  = (inside_patch / (p * p)) % C;                         // channel
+    int di = ij / p;                                               // row within patch
+    int dj = ij % p;                                               // col within patch
+
+    int h = ph * p + di;
+    int w = pw * p + dj;
+
+    long img_idx  = (((long)b * C + c) * H + h) * W + w;
+    long out_idx  = (((long)b * num_patches_h * num_patches_w +
+                      ph * num_patches_w + pw) * patch_dim) + inside_patch;
+
+    patches[out_idx] = img[img_idx];
+}
+
+torch::Tensor extract_patches_cuda(torch::Tensor img, int64_t p) {
+    TORCH_CHECK(img.is_cuda(), "extract_patches_cuda: input tensor must be on CUDA");
+    TORCH_CHECK(img.scalar_type() == torch::kFloat32,
+                "extract_patches_cuda: only float32 tensors are supported");
+
+    img = img.contiguous();
+
+    const int64_t B = img.size(0);
+    const int64_t C = img.size(1);
+    const int64_t H = img.size(2);
+    const int64_t W = img.size(3);
+
+    TORCH_CHECK(H % p == 0 && W % p == 0,
+                "extract_patches_cuda: image dimensions must be divisible by patch size");
+
+    const int64_t num_patches_h = H / p;
+    const int64_t num_patches_w = W / p;
+    const int64_t num_patches   = num_patches_h * num_patches_w;
+    const int64_t patch_dim     = C * p * p;
+
+    auto out = torch::empty({B, num_patches, patch_dim}, img.options());
+
+    const long total_elements = B * num_patches * patch_dim;
+    const int block_size = 256;
+    const int num_blocks = (total_elements + block_size - 1) / block_size;
+
+    AT_DISPATCH_FLOATING_TYPES(img.scalar_type(), "extract_patches_cuda", ([&] {
+        extract_patches_kernel<scalar_t><<<num_blocks, block_size>>>(
+            img.data_ptr<scalar_t>(),
+            out.data_ptr<scalar_t>(),
+            (int)B, (int)C, (int)H, (int)W,
+            (int)p,
+            (int)num_patches_h,
+            (int)num_patches_w
+        );
+    }));
+
+    return out;
+}
+
+/* --------------------------------------------------------------------- */
+/* Positional embedding addition kernel                                  */
+/* --------------------------------------------------------------------- */
+template <typename scalar_t>
+__global__ void add_pos_emb_kernel(
+    scalar_t* __restrict__ x,
+    const scalar_t* __restrict__ pos,
+    const long elements,
+    const long pos_elements)
+{
+    long idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= elements) return;
+    x[idx] += pos[idx % pos_elements];
+}
+
+torch::Tensor add_pos_embedding_cuda(torch::Tensor x, torch::Tensor pos) {
+    TORCH_CHECK(x.is_cuda() && pos.is_cuda(),
+                "add_pos_embedding_cuda: inputs must be on CUDA");
+    TORCH_CHECK(x.scalar_type() == torch::kFloat32 && pos.scalar_type() == torch::kFloat32,
+                "add_pos_embedding_cuda: only float32 tensors are supported");
+    TORCH_CHECK(pos.size(0) == 1,
+                "add_pos_embedding_cuda: positional embedding shape must start with 1");
+
+    x = x.contiguous();
+    pos = pos.contiguous();
+
+    const long elements     = x.numel();
+    const long pos_elements = pos.numel();
+
+    const int block_size = 256;
+    const int num_blocks = (elements + block_size - 1) / block_size;
+
+    AT_DISPATCH_FLOATING_TYPES(x.scalar_type(), "add_pos_embedding_cuda", ([&] {
+        add_pos_emb_kernel<scalar_t><<<num_blocks, block_size>>>(
+            x.data_ptr<scalar_t>(),
+            pos.data_ptr<scalar_t>(),
+            elements,
+            pos_elements
+        );
+    }));
+
+    return x;
+}
+"""
+
+cpp_header = r"""
+torch::Tensor extract_patches_cuda(torch::Tensor img, int64_t p);
+torch::Tensor add_pos_embedding_cuda(torch::Tensor x, torch::Tensor pos);
+"""
+
+kernels = load_inline(
+    name="vit_custom_kernels",
+    cpp_sources=cpp_header,
+    cuda_sources=cuda_source,
+    functions=["extract_patches_cuda", "add_pos_embedding_cuda"],
+    verbose=False,
+)
+
+# ------------------------------------------------------------------------
+# Optimised Vision Transformer model
+# ------------------------------------------------------------------------
+class ModelNew(nn.Module):
+    def __init__(self, image_size, patch_size, num_classes, dim, depth, heads,
+                 mlp_dim, channels=3, dropout=0.1, emb_dropout=0.1):
+        super().__init__()
+
+        assert image_size % patch_size == 0, "Image dimensions must be divisible by the patch size."
+        num_patches = (image_size // patch_size) ** 2
+        patch_dim   = channels * patch_size ** 2
+
+        self.patch_size = patch_size
+
+        # Parameters / layers
+        self.pos_embedding      = nn.Parameter(torch.randn(1, num_patches + 1, dim))
+        self.patch_to_embedding = nn.Linear(patch_dim, dim)
+        self.cls_token          = nn.Parameter(torch.randn(1, 1, dim))
+        self.dropout            = nn.Dropout(emb_dropout)
+
+        self.transformer = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(d_model=dim,
+                                       nhead=heads,
+                                       dim_feedforward=mlp_dim,
+                                       dropout=dropout),
+            num_layers=depth
+        )
+
+        self.to_cls_token = nn.Identity()
+        self.mlp_head = nn.Sequential(
+            nn.Linear(dim, mlp_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_dim, num_classes)
+        )
+
+        # Bind CUDA kernels
+        self.extract_patches = kernels.extract_patches_cuda
+        self.add_positional  = kernels.add_pos_embedding_cuda
+
+    def forward(self, img: torch.Tensor) -> torch.Tensor:
+        """
+        img: (batch_size, channels, image_size, image_size)
+        """
+        p = self.patch_size
+
+        # ------------------------------------------------------------------
+        # 1. Extract patches (custom CUDA) -> shape: (B, num_patches, patch_dim)
+        # ------------------------------------------------------------------
+        x = self.extract_patches(img, p)
+
+        # ------------------------------------------------------------------
+        # 2. Linear projection of flattened patches
+        # ------------------------------------------------------------------
+        x = self.patch_to_embedding(x)  # (B, num_patches, dim)
+
+        # ------------------------------------------------------------------
+        # 3. Prepended class token
+        # ------------------------------------------------------------------
+        cls_tokens = self.cls_token.expand(img.size(0), -1, -1)  # (B,1,dim)
+        x = torch.cat((cls_tokens, x), dim=1)                    # (B, num_patches+1, dim)
+
+        # ------------------------------------------------------------------
+        # 4. Add positional embedding (custom CUDA)
+        # ------------------------------------------------------------------
+        x = self.add_positional(x, self.pos_embedding)
+
+        # 5. Dropout, Transformer, Classification head
+        x = self.dropout(x)
+        x = self.transformer(x)
+        x = self.to_cls_token(x[:, 0])
+        return self.mlp_head(x)
+
+
+# ------------------------------------------------------------------------
+# Helper functions for benchmarking / external use
+# ------------------------------------------------------------------------
+def get_inputs():
+    # randomly generate input tensors based on the model architecture
+    return [torch.rand(2, 3, 112, 112).cuda()]
+
+def get_init_inputs():
+    # randomly generate tensors required for initialization
+    return [112, 16, 10, 512, 6, 8, 2048, 3, 0.0, 0.0]

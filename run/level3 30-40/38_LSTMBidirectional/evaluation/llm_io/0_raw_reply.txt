@@ -1,0 +1,171 @@
+```python
+import math
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# ----------------------------------------------------------------------
+# Custom CUDA kernel: Fused "take last timestep + Linear" operation
+# ----------------------------------------------------------------------
+cuda_source = r"""
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+////////////////////////////////////////////////////////////////////////////////
+// Kernel
+////////////////////////////////////////////////////////////////////////////////
+__global__ void last_step_linear_kernel(const float* __restrict__ x,      // [B, S, I]
+                                        const float* __restrict__ weight, // [O, I]
+                                        const float* __restrict__ bias,   // [O] or nullptr
+                                        float* __restrict__ out,          // [B, O]
+                                        int B, int S, int I, int O) {
+    int b = blockIdx.x;                                    // batch index
+    int o = blockIdx.y * blockDim.x + threadIdx.x;         // output-feature index
+
+    if (o >= O) return;
+
+    const float* x_ptr = x + ((b * S + (S - 1)) * I);      // pointer to last timestep of sample b
+    const float* w_ptr = weight + o * I;                   // weights for output feature o
+
+    float acc = (bias != nullptr) ? bias[o] : 0.0f;
+
+    // Simple dot-product
+    for (int i = 0; i < I; ++i) {
+        acc += w_ptr[i] * x_ptr[i];
+    }
+    out[b * O + o] = acc;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// C++/CUDA front-end
+////////////////////////////////////////////////////////////////////////////////
+torch::Tensor last_step_linear_cuda(torch::Tensor x,
+                                    torch::Tensor weight,
+                                    torch::Tensor bias) {
+    TORCH_CHECK(x.is_cuda(),      "x must reside on CUDA");
+    TORCH_CHECK(weight.is_cuda(), "weight must reside on CUDA");
+    TORCH_CHECK(bias.is_cuda(),   "bias must reside on CUDA");
+    TORCH_CHECK(x.dtype() == torch::kFloat32,      "x must be float32");
+    TORCH_CHECK(weight.dtype() == torch::kFloat32, "weight must be float32");
+    TORCH_CHECK(bias.dtype() == torch::kFloat32,   "bias must be float32");
+
+    const int B = x.size(0);
+    const int S = x.size(1);
+    const int I = x.size(2);
+    const int O = weight.size(0);
+
+    auto out = torch::empty({B, O}, x.options());
+
+    const int threads = 256;
+    dim3 block(threads);
+    dim3 grid(B, (O + threads - 1) / threads);
+
+    last_step_linear_kernel<<<grid, block>>>(
+        x.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias.numel() ? bias.data_ptr<float>() : nullptr,
+        out.data_ptr<float>(),
+        B, S, I, O
+    );
+
+    return out;
+}
+"""
+
+cpp_source = "torch::Tensor last_step_linear_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias);"
+
+# Build the inline extension
+last_step_linear_ext = load_inline(
+    name        = "last_step_linear_ext",
+    cpp_sources = cpp_source,
+    cuda_sources = cuda_source,
+    functions   = ["last_step_linear_cuda"],
+    verbose     = False,
+    extra_cflags=["-O3"],
+    extra_cuda_cflags=["-O3"]
+)
+
+# ----------------------------------------------------------------------
+# PyTorch wrapper for the fused operator
+# ----------------------------------------------------------------------
+class LastStepLinear(nn.Module):
+    """
+    A Linear layer that:
+      1. Takes a 3-D tensor [B, S, I]
+      2. Picks the last timestep (index S-1)
+      3. Applies a Linear transform to size O
+    Implemented via a hand-written CUDA kernel above.
+    """
+    def __init__(self, in_features: int, out_features: int, bias: bool = True):
+        super().__init__()
+        self.in_features  = in_features
+        self.out_features = out_features
+
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_features))
+        else:
+            self.register_parameter("bias", None)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            bound = 1 / math.sqrt(self.in_features)
+            nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x : [B, S, I]  (contiguity required by the kernel)
+        if not x.is_contiguous():
+            x = x.contiguous()
+        return last_step_linear_ext.last_step_linear_cuda(
+            x, self.weight,
+            self.bias if self.bias is not None else torch.empty(
+                0, device=x.device, dtype=x.dtype)
+        )
+
+# ----------------------------------------------------------------------
+# Optimised model
+# ----------------------------------------------------------------------
+class ModelNew(nn.Module):
+    def __init__(self,
+                 input_size:   int,
+                 hidden_size:  int,
+                 num_layers:   int,
+                 output_size:  int,
+                 dropout:      float = 0.0):
+        super().__init__()
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers,
+                            batch_first=True, dropout=dropout,
+                            bidirectional=True)
+        self.fc = LastStepLinear(hidden_size * 2, output_size)
+
+    def forward(self, x, h0, c0):
+        # LSTM forward
+        out, _ = self.lstm(x, (h0, c0))  # out: [B, S, 2*H]
+        # Fused "take last + linear"
+        return self.fc(out)
+
+# ----------------------------------------------------------------------
+# Helpers (required by the evaluation harness)
+# ----------------------------------------------------------------------
+batch_size       = 5
+sequence_length  = 128
+input_size       = 64
+hidden_size      = 128
+num_layers       = 6
+output_size      = 10
+dropout          = 0.0
+
+def get_inputs():
+    return [
+        torch.rand(batch_size, sequence_length, input_size, device="cuda"),
+        torch.rand(num_layers * 2, batch_size, hidden_size, device="cuda"),
+        torch.rand(num_layers * 2, batch_size, hidden_size, device="cuda"),
+    ]
+
+def get_init_inputs():
+    return [input_size, hidden_size, num_layers, output_size, dropout]
+```

@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Conv2d layers created with bias=False",
+  "why_it_matters": "Reference model includes convolution biases; their removal alters activations (especially with BatchNorm in eval mode), producing divergent outputs.",
+  "minimal_fix_hint": "set bias=True on both Conv2d layers"
+}
+```

@@ -1,0 +1,211 @@
+You are a senior CUDA-extension developer.
+Your job is to **FIX** the compilation or runtime errors in the Python script
+shown below.
+
+OUTPUT RULES (STRICT) ────────────────────────────────────────────────
+1. Inside the block, follow **exactly** this order:
+   1. Imports – `torch`, `torch.nn`, `load_inline`.
+   2. `source` – triple‑quoted CUDA string(s) (kernel + host wrapper).
+   3. `cpp_src` – prototypes for *all* kernels you expose.
+   4. **One** `load_inline` call per kernel group.
+   5. `class ModelNew(nn.Module)` – mirrors original inputs/outputs but calls
+      your CUDA kernels.
+2. **Do NOT include** testing code, `if __name__ == "__main__"`, or extra prose.
+
+────────────────────────────────────────
+ERROR LOG
+────────────────────────────────────────
+/home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/utils/cpp_extension.py:2356: UserWarning: TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'].
+  warnings.warn(
+Error building extension 'fused_add_layernorm': [1/3] c++ -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=fused_add_layernorm -DTORCH_API_INCLUDE_EXTENSION_H -DPYBIND11_COMPILER_TYPE=\"_gcc\" -DPYBIND11_STDLIB=\"_libstdcpp\" -DPYBIND11_BUILD_ABI=\"_cxxabi1016\" -isystem /home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/include -isystem /home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/include/torch/csrc/api/include -isystem /home/wan00559/miniconda3/envs/maxk/include/python3.11 -D_GLIBCXX_USE_CXX11_ABI=1 -fPIC -std=c++17 -c /home/wan00559/.cache/torch_extensions/py311_cu126/fused_add_layernorm/main.cpp -o main.o 
+[2/3] /usr/bin/nvcc --generate-dependencies-with-compile --dependency-output cuda.cuda.o.d -DTORCH_EXTENSION_NAME=fused_add_layernorm -DTORCH_API_INCLUDE_EXTENSION_H -DPYBIND11_COMPILER_TYPE=\"_gcc\" -DPYBIND11_STDLIB=\"_libstdcpp\" -DPYBIND11_BUILD_ABI=\"_cxxabi1016\" -isystem /home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/include -isystem /home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/include/torch/csrc/api/include -isystem /home/wan00559/miniconda3/envs/maxk/include/python3.11 -D_GLIBCXX_USE_CXX11_ABI=1 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_75,code=compute_75 -gencode=arch=compute_75,code=sm_75 --compiler-options '-fPIC' -std=c++17 -c /home/wan00559/.cache/torch_extensions/py311_cu126/fused_add_layernorm/cuda.cu -o cuda.cuda.o 
+/home/wan00559/.cache/torch_extensions/py311_cu126/fused_add_layernorm/cuda.cu(35): warning #177-D: variable "sum" was declared but never referenced
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+[3/3] c++ main.o cuda.cuda.o -shared -L/home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/lib -lc10 -lc10_cuda -ltorch_cpu -ltorch_cuda -ltorch -ltorch_python -L/usr/lib64 -lcudart -o fused_add_layernorm.so
+FAILED: fused_add_layernorm.so 
+c++ main.o cuda.cuda.o -shared -L/home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/lib -lc10 -lc10_cuda -ltorch_cpu -ltorch_cuda -ltorch -ltorch_python -L/usr/lib64 -lcudart -o fused_add_layernorm.so
+/usr/bin/ld: cuda.cuda.o: in function `PyInit_fused_add_layernorm':
+tmpxft_000152a1_00000000-6_cuda.cudafe1.cpp:(.text+0x5e6): multiple definition of `PyInit_fused_add_layernorm'; main.o:main.cpp:(.text+0x257): first defined here
+collect2: error: ld returned 1 exit status
+ninja: build stopped: subcommand failed.
+
+────────────────────────────────────────
+OLD CODE (read-only)
+────────────────────────────────────────
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+
+CUDA_SRC = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+template<int TPB>
+__global__ void fused_add_ln_kernel(
+        const float* __restrict__ a,
+        const float* __restrict__ b,
+        const float* __restrict__ gamma,
+        const float* __restrict__ beta,
+        float* __restrict__ out,
+        int rows,
+        int cols,
+        float eps)
+{
+    extern __shared__ float shared_mem[];
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+
+    // pointer to the first element of this row
+    int base = row * cols;
+
+    // each thread processes one column element if in range
+    float val = 0.0f;
+    if (tid < cols) {
+        val = a[base + tid] + b[base + tid];   // residual connection + addition
+    }
+    shared_mem[tid] = (tid < cols) ? val : 0.0f;
+    __syncthreads();
+
+    // ----- compute mean -----
+    float sum = shared_mem[tid];
+    // reduction in shared memory
+    for (int stride = TPB >> 1; stride > 0; stride >>= 1) {
+        __syncthreads();
+        if (tid < stride)
+            shared_mem[tid] += shared_mem[tid + stride];
+    }
+    float mean = shared_mem[0] / static_cast<float>(cols);
+
+    // ----- compute variance -----
+    float diff = (tid < cols) ? (val - mean) : 0.0f;
+    shared_mem[tid] = diff * diff;
+    __syncthreads();
+    for (int stride = TPB >> 1; stride > 0; stride >>= 1) {
+        __syncthreads();
+        if (tid < stride)
+            shared_mem[tid] += shared_mem[tid + stride];
+    }
+    float var = shared_mem[0] / static_cast<float>(cols);
+    float inv_std = rsqrtf(var + eps);
+
+    // ----- normalize, scale, shift -----
+    if (tid < cols) {
+        float norm = (val - mean) * inv_std;
+        out[base + tid] = norm * gamma[tid] + beta[tid];
+    }
+}
+
+torch::Tensor fused_add_layernorm_cuda(torch::Tensor a,
+                                       torch::Tensor b,
+                                       torch::Tensor gamma,
+                                       torch::Tensor beta,
+                                       double eps) {
+    TORCH_CHECK(a.is_cuda() && b.is_cuda(), "Input tensors must be CUDA tensors");
+    TORCH_CHECK(a.sizes() == b.sizes(), "a and b must have the same shape");
+    TORCH_CHECK(a.dtype() == torch::kFloat32, "Only float32 is supported");
+
+    auto out = torch::empty_like(a);
+    int seq_len = a.size(0);
+    int batch = a.size(1);
+    int rows = seq_len * batch;          // flatten the first two dims
+    int cols = a.size(2);               // embedding dimension
+
+    const int TPB = 1024;               // threads per block
+    int tpb = 1;
+    // choose tpb as power-of-two >= cols and <=1024
+    while (tpb < cols) tpb <<= 1;
+    if (tpb > TPB) tpb = TPB;
+
+    dim3 block(tpb);
+    dim3 grid(rows);
+    size_t shm = tpb * sizeof(float);
+
+    fused_add_ln_kernel<1024><<<grid, block, shm>>>(
+        a.data_ptr<float>(),
+        b.data_ptr<float>(),
+        gamma.data_ptr<float>(),
+        beta.data_ptr<float>(),
+        out.data_ptr<float>(),
+        rows,
+        cols,
+        static_cast<float>(eps)
+    );
+    return out;
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("fused_add_layernorm_cuda", &fused_add_layernorm_cuda, "Fused Add+LayerNorm (CUDA)");
+}
+"""
+
+CPP_DECL = "torch::Tensor fused_add_layernorm_cuda(torch::Tensor a, torch::Tensor b, torch::Tensor gamma, torch::Tensor beta, double eps);"
+
+fused_add_ln = load_inline(
+    name="fused_add_layernorm",
+    cpp_sources=CPP_DECL,
+    cuda_sources=CUDA_SRC,
+    functions=["fused_add_layernorm_cuda"],
+    verbose=False,
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, embed_dim, num_heads):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=False)
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, x):
+        """
+        :param x: Input tensor of shape (B, C, H, W)
+        :return: Tensor of the same shape after MHA + residual + LayerNorm
+        """
+        B, C, H, W = x.shape
+        x_reshaped = x.view(B, C, H * W).permute(2, 0, 1)  # (seq_len, B, C)
+
+        attn_output, _ = self.attn(x_reshaped, x_reshaped, x_reshaped)
+
+        # Fused residual connection + LayerNorm
+        y = fused_add_ln.fused_add_layernorm_cuda(
+            attn_output.contiguous(),
+            x_reshaped.contiguous(),
+            self.norm.weight.contiguous(),
+            self.norm.bias.contiguous(),
+            self.norm.eps,
+        )
+
+        y = y.permute(1, 2, 0).view(B, C, H, W)
+        return y
+
+
+# Maintain the same helper functions
+embed_dim = 64
+num_heads = 4
+batch_size = 2
+num_channels = embed_dim
+image_height = 64
+image_width = 64
+
+
+def get_inputs():
+    return [torch.rand(batch_size, num_channels, image_height, image_width).cuda()]
+
+
+def get_init_inputs():
+    return [embed_dim, num_heads]
+
+────────────────────────────────────────
+Main Critical Problem
+────────────────────────────────────────
+critical_issue: Reduction loops use fixed TPB=1024 regardless of blockDim.x
+why_it_matters: When cols<1024 kernel allocates fewer shared floats but accesses indices up to 1023, leading to OOB writes and wrong outputs.
+minimal_fix_hint: base reduction on blockDim.x, allocate matching shared memory
+
+```python
+# <your corrected code>
+```
+# ==========================================================

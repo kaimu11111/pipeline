@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "No clear mismatch detected",
+  "why_it_matters": "CUDA kernel and autograd logic replicate reference behavior; no evident output or gradient divergence.",
+  "minimal_fix_hint": "No fix needed"
+}
+```

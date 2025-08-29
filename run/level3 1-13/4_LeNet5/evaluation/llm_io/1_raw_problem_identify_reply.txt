@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Kernel file lacks CUDAContext include",
+  "why_it_matters": "at::cuda::getCurrentCUDAStream is undefined, compilation aborts, fused op never builds, model crashes.",
+  "minimal_fix_hint": "add #include <ATen/cuda/CUDAContext.h>"
+}
+```

@@ -1,0 +1,5 @@
+task,best_score,best_runnable,task_dir,figure
+KernelBench/level3test2/40_GRUHidden.py,0.003185,1,/home/wan00559/pipleline/run/20250828_171511_40_GRUHidden/40_GRUHidden,/home/wan00559/pipleline/run/20250828_171511_40_GRUHidden/40_GRUHidden/figures/40_GRUHidden_score.png
+
+avg_speedup,0.003185
+accuracy,1.000000

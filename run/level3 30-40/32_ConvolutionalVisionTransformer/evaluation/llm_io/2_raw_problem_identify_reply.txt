@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "CUDA wrapper returns tensor with no autograd tracking",
+  "why_it_matters": "Output is detached, so gradients never reach cls_token, linear_proj, conv1 etc., diverging behaviour during any training or backward pass.",
+  "minimal_fix_hint": "Wrap kernel in torch::autograd::Function with proper backward."
+}
+```

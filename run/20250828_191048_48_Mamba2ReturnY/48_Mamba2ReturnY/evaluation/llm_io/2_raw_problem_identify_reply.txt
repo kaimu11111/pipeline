@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "torch.einsum misuse for block reshape; passes int",
+  "why_it_matters": "Forward crashes before computation, so outputs/gradients are impossible, entirely diverging from reference behavior.",
+  "minimal_fix_hint": "Use einops.rearrange or reshape instead"
+}
+```

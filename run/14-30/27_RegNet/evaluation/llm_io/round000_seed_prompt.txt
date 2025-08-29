@@ -1,0 +1,173 @@
+
+You write custom CUDA kernels to replace the pytorch operators in the given architecture 
+to get speedups.You have complete freedom to choose the set of operators you want to replace. You may
+make the decision to replace some operators with custom CUDA kernels and leave others
+unchanged. You may replace multiple operators with custom implementations, consider
+operator fusion opportunities (combining multiple operators into a single kernel, for
+example, combining matmul+relu), or algorithmic changes (such as online softmax). You are
+only limited by your imagination.
+
+Here\’s an example to show you the syntax of inline embedding custom CUDA operators in torch: 
+The example given architecture is:
+‘‘‘
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class Model(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, a, b):
+        return a + b
+
+
+def get_inputs():
+    # randomly generate input tensors based on the model architecture
+    a = torch.randn(1, 128).cuda()
+    b = torch.randn(1, 128).cuda()
+    return [a, b]
+
+
+def get_init_inputs():
+    # randomly generate tensors required for initialization based on the model architecture
+    return []
+‘‘‘
+The example new arch with custom CUDA kernels looks like this:
+‘‘‘
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for element-wise addition
+source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void elementwise_add_kernel(const float* a, const float* b, float* out, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        out[idx] = a[idx] + b[idx];
+    }
+}
+
+torch::Tensor elementwise_add_cuda(torch::Tensor a, torch::Tensor b) {
+    auto size = a.numel();
+    auto out = torch::zeros_like(a);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    elementwise_add_kernel<<<num_blocks, block_size>>>(a.data_ptr<float>(), b.data_ptr<float>(), out.data_ptr<float>(), size);
+
+    return out;
+}
+"""
+
+cpp_src = (
+    "torch::Tensor elementwise_add_cuda(torch::Tensor a, torch::Tensor b);"
+)
+
+# Compile the inline CUDA code for element-wise addition
+elementwise_add = load_inline(
+    name="elementwise_add",
+    cpp_sources=cpp_src,
+    cuda_sources=source,
+    functions=["elementwise_add_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.elementwise_add = elementwise_add
+
+    def forward(self, a, b):
+        return self.elementwise_add.elementwise_add_cuda(a, b)
+‘‘‘
+
+You are given the following architecture:
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class Model(nn.Module):
+    def __init__(self, input_channels, stages, block_widths, output_classes):
+        """
+        :param input_channels: int, Number of input channels for the first layer
+        :param stages: int, Number of stages in the RegNet architecture
+        :param block_widths: List[int], Width (number of channels) for each block in the stages
+        :param output_classes: int, Number of output classes for classification
+        """
+        super(Model, self).__init__()
+
+        self.stages = stages
+        self.block_widths = block_widths
+        
+        layers = []
+        current_channels = input_channels
+        
+        # Construct the stages with their respective blocks
+        for i in range(stages):
+            layers.append(self._make_stage(current_channels, block_widths[i]))
+            current_channels = block_widths[i]
+        
+        self.feature_extractor = nn.Sequential(*layers)
+        
+        # Final fully connected layer for classification
+        self.fc = nn.Linear(block_widths[-1], output_classes)
+    
+    def _make_stage(self, in_channels, out_channels):
+        """
+        Creates a simple block for each stage.
+        :param in_channels: int, number of input channels
+        :param out_channels: int, number of output channels
+        :return: nn.Sequential block with convolutional layers
+        """
+        return nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2)
+        )
+
+    def forward(self, x):
+        """
+        Forward pass through the RegNet model.
+        :param x: torch.Tensor of shape (batch_size, input_channels, height, width)
+        :return: torch.Tensor of shape (batch_size, output_classes)
+        """
+        x = self.feature_extractor(x)
+        x = torch.mean(x, dim=[2, 3])  # Global Average Pooling
+        x = self.fc(x)
+        return x
+
+# Test code for the RegNet model
+batch_size = 4
+input_channels = 3
+image_height, image_width = 56, 56
+stages = 3
+block_widths = [32, 64, 128]
+output_classes = 10
+
+def get_inputs():
+    """ Generates random input tensor of shape (batch_size, input_channels, height, width) """
+    return [torch.rand(batch_size, input_channels, image_height, image_width)]
+
+def get_init_inputs():
+    """ Initializes model parameters """
+    return [input_channels, stages, block_widths, output_classes]
+```
+Optimize the architecture named Model with custom CUDA operators! Name your optimized
+output architecture ModelNew. Output the new code in codeblocks. Please generate real
+code, NOT pseudocode, make sure the code compiles and is fully functional. Just output
+the new model code, no other text, and NO testing code!

@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Kernel’s segment sum is inclusive of j (off-by-one).",
+  "why_it_matters": "Produces wrong L matrix; even diagonal should be 1 but becomes exp(A_i), propagating huge errors downstream.",
+  "minimal_fix_hint": "Store before adding, or subtract x[j] to make j exclusive."
+}
+```

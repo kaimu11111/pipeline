@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "fast_gelu_cuda defined as inline, symbol not exported",
+  "why_it_matters": "PyBind wrapper expects global symbol; linker can drop inline function, causing undefined-symbol load failure, model unusable.",
+  "minimal_fix_hint": "remove 'inline' or add explicit non-inline definition"
+}
+```

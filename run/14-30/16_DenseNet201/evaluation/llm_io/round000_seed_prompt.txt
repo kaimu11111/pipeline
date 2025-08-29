@@ -1,0 +1,226 @@
+
+You write custom CUDA kernels to replace the pytorch operators in the given architecture 
+to get speedups.You have complete freedom to choose the set of operators you want to replace. You may
+make the decision to replace some operators with custom CUDA kernels and leave others
+unchanged. You may replace multiple operators with custom implementations, consider
+operator fusion opportunities (combining multiple operators into a single kernel, for
+example, combining matmul+relu), or algorithmic changes (such as online softmax). You are
+only limited by your imagination.
+
+Here\’s an example to show you the syntax of inline embedding custom CUDA operators in torch: 
+The example given architecture is:
+‘‘‘
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class Model(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, a, b):
+        return a + b
+
+
+def get_inputs():
+    # randomly generate input tensors based on the model architecture
+    a = torch.randn(1, 128).cuda()
+    b = torch.randn(1, 128).cuda()
+    return [a, b]
+
+
+def get_init_inputs():
+    # randomly generate tensors required for initialization based on the model architecture
+    return []
+‘‘‘
+The example new arch with custom CUDA kernels looks like this:
+‘‘‘
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for element-wise addition
+source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void elementwise_add_kernel(const float* a, const float* b, float* out, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        out[idx] = a[idx] + b[idx];
+    }
+}
+
+torch::Tensor elementwise_add_cuda(torch::Tensor a, torch::Tensor b) {
+    auto size = a.numel();
+    auto out = torch::zeros_like(a);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    elementwise_add_kernel<<<num_blocks, block_size>>>(a.data_ptr<float>(), b.data_ptr<float>(), out.data_ptr<float>(), size);
+
+    return out;
+}
+"""
+
+cpp_src = (
+    "torch::Tensor elementwise_add_cuda(torch::Tensor a, torch::Tensor b);"
+)
+
+# Compile the inline CUDA code for element-wise addition
+elementwise_add = load_inline(
+    name="elementwise_add",
+    cpp_sources=cpp_src,
+    cuda_sources=source,
+    functions=["elementwise_add_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.elementwise_add = elementwise_add
+
+    def forward(self, a, b):
+        return self.elementwise_add.elementwise_add_cuda(a, b)
+‘‘‘
+
+You are given the following architecture:
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class DenseBlock(nn.Module):
+    def __init__(self, num_layers: int, num_input_features: int, growth_rate: int):
+        """
+        :param num_layers: The number of layers in the dense block
+        :param num_input_features: The number of input feature maps
+        :param growth_rate: The growth rate for the dense block (new features added per layer)
+        """
+        super(DenseBlock, self).__init__()
+        layers = []
+        for i in range(num_layers):
+            layers.append(self._make_layer(num_input_features + i * growth_rate, growth_rate))
+        self.layers = nn.ModuleList(layers)
+
+    def _make_layer(self, in_features: int, growth_rate: int):
+        """
+        Creates a single layer with BatchNorm, ReLU, Conv2D, and Dropout.
+        """
+        return nn.Sequential(
+            nn.BatchNorm2d(in_features),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_features, growth_rate, kernel_size=3, padding=1, bias=False),
+            nn.Dropout(0.0)
+        )
+
+    def forward(self, x):
+        """
+        :param x: Input tensor of shape (batch_size, num_input_features, height, width)
+        :return: Concatenated output tensor with shape (batch_size, num_output_features, height, width)
+        """
+        features = [x]
+        for layer in self.layers:
+            new_feature = layer(x)
+            features.append(new_feature)
+            x = torch.cat(features, 1)  # Concatenate along channel axis
+        return x
+
+class TransitionLayer(nn.Module):
+    def __init__(self, num_input_features: int, num_output_features: int):
+        """
+        :param num_input_features: The number of input feature maps
+        :param num_output_features: The number of output feature maps
+        """
+        super(TransitionLayer, self).__init__()
+        self.transition = nn.Sequential(
+            nn.BatchNorm2d(num_input_features),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(num_input_features, num_output_features, kernel_size=1, bias=False),
+            nn.AvgPool2d(kernel_size=2, stride=2)
+        )
+
+    def forward(self, x):
+        """
+        :param x: Input tensor of shape (batch_size, num_input_features, height, width)
+        :return: Downsampled tensor with reduced number of feature maps
+        """
+        return self.transition(x)
+
+class Model(nn.Module):
+    def __init__(self, growth_rate: int = 32, num_classes: int = 1000):
+        """
+        :param growth_rate: The growth rate of the DenseNet (new features added per layer)
+        :param num_classes: The number of output classes for classification
+        """
+        super(Model, self).__init__()
+
+        # Initial convolution and pooling
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        )
+
+        # Each dense block is followed by a transition layer, except the last one
+        num_features = 64
+        block_layers = [6, 12, 48, 32]  # Corresponding layers in DenseNet201
+
+        self.dense_blocks = nn.ModuleList()
+        self.transition_layers = nn.ModuleList()
+
+        for i, num_layers in enumerate(block_layers):
+            block = DenseBlock(num_layers=num_layers, num_input_features=num_features, growth_rate=growth_rate)
+            self.dense_blocks.append(block)
+            num_features = num_features + num_layers * growth_rate
+
+            if i != len(block_layers) - 1:
+                transition = TransitionLayer(num_input_features=num_features, num_output_features=num_features // 2)
+                self.transition_layers.append(transition)
+                num_features = num_features // 2
+
+        # Final batch norm and classifier
+        self.final_bn = nn.BatchNorm2d(num_features)
+        self.classifier = nn.Linear(num_features, num_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        :param x: Input tensor of shape (batch_size, 3, height, width)
+        :return: Output tensor of shape (batch_size, num_classes)
+        """
+        x = self.features(x)
+
+        for i, block in enumerate(self.dense_blocks):
+            x = block(x)
+            if i != len(self.dense_blocks) - 1:
+                x = self.transition_layers[i](x)
+
+        x = self.final_bn(x)
+        x = F.relu(x, inplace=True)
+        x = F.adaptive_avg_pool2d(x, (1, 1)).view(x.size(0), -1)
+        x = self.classifier(x)
+        return x
+
+# Testing the DenseNet201 model
+batch_size = 5
+num_classes = 5
+height, width = 112, 112  # Standard input size for DenseNet
+
+def get_inputs():
+    return [torch.rand(batch_size, 3, height, width)]
+
+def get_init_inputs():
+    return [32, num_classes]
+```
+Optimize the architecture named Model with custom CUDA operators! Name your optimized
+output architecture ModelNew. Output the new code in codeblocks. Please generate real
+code, NOT pseudocode, make sure the code compiles and is fully functional. Just output
+the new model code, no other text, and NO testing code!

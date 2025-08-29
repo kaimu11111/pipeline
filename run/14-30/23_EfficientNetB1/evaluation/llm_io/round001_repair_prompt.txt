@@ -1,0 +1,216 @@
+You are a senior CUDA-extension developer.
+Your job is to **FIX** the compilation or runtime errors in the Python script
+shown below.
+
+OUTPUT RULES (STRICT) ────────────────────────────────────────────────
+1. Inside the block, follow **exactly** this order:
+   1. Imports – `torch`, `torch.nn`, `load_inline`.
+   2. `source` – triple‑quoted CUDA string(s) (kernel + host wrapper).
+   3. `cpp_src` – prototypes for *all* kernels you expose.
+   4. **One** `load_inline` call per kernel group.
+   5. `class ModelNew(nn.Module)` – mirrors original inputs/outputs but calls
+      your CUDA kernels.
+2. **Do NOT include** testing code, `if __name__ == "__main__"`, or extra prose.
+
+────────────────────────────────────────
+ERROR LOG
+────────────────────────────────────────
+/home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/utils/cpp_extension.py:2356: UserWarning: TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'].
+  warnings.warn(
+Error building extension 'custom_relu6': [1/3] c++ -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=custom_relu6 -DTORCH_API_INCLUDE_EXTENSION_H -DPYBIND11_COMPILER_TYPE=\"_gcc\" -DPYBIND11_STDLIB=\"_libstdcpp\" -DPYBIND11_BUILD_ABI=\"_cxxabi1016\" -isystem /home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/include -isystem /home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/include/torch/csrc/api/include -isystem /home/wan00559/miniconda3/envs/maxk/include/python3.11 -D_GLIBCXX_USE_CXX11_ABI=1 -fPIC -std=c++17 -c /home/wan00559/.cache/torch_extensions/py311_cu126/custom_relu6/main.cpp -o main.o 
+[2/3] /usr/bin/nvcc --generate-dependencies-with-compile --dependency-output cuda.cuda.o.d -DTORCH_EXTENSION_NAME=custom_relu6 -DTORCH_API_INCLUDE_EXTENSION_H -DPYBIND11_COMPILER_TYPE=\"_gcc\" -DPYBIND11_STDLIB=\"_libstdcpp\" -DPYBIND11_BUILD_ABI=\"_cxxabi1016\" -isystem /home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/include -isystem /home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/include/torch/csrc/api/include -isystem /home/wan00559/miniconda3/envs/maxk/include/python3.11 -D_GLIBCXX_USE_CXX11_ABI=1 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_75,code=compute_75 -gencode=arch=compute_75,code=sm_75 --compiler-options '-fPIC' -std=c++17 -c /home/wan00559/.cache/torch_extensions/py311_cu126/custom_relu6/cuda.cu -o cuda.cuda.o 
+[3/3] c++ main.o cuda.cuda.o -shared -L/home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/lib -lc10 -lc10_cuda -ltorch_cpu -ltorch_cuda -ltorch -ltorch_python -L/usr/lib64 -lcudart -o custom_relu6.so
+FAILED: custom_relu6.so 
+c++ main.o cuda.cuda.o -shared -L/home/wan00559/miniconda3/envs/maxk/lib/python3.11/site-packages/torch/lib -lc10 -lc10_cuda -ltorch_cpu -ltorch_cuda -ltorch -ltorch_python -L/usr/lib64 -lcudart -o custom_relu6.so
+/usr/bin/ld: cuda.cuda.o: in function `PyInit_custom_relu6':
+tmpxft_00020ab0_00000000-6_cuda.cudafe1.cpp:(.text+0xee0): multiple definition of `PyInit_custom_relu6'; main.o:main.cpp:(.text+0x257): first defined here
+collect2: error: ld returned 1 exit status
+ninja: build stopped: subcommand failed.
+
+────────────────────────────────────────
+OLD CODE (read-only)
+────────────────────────────────────────
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# ---------------------------------------------------------------------------
+# Custom CUDA implementation of ReLU6 (forward + backward)
+# ---------------------------------------------------------------------------
+
+cuda_source = r"""
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+template <typename scalar_t>
+__global__ void relu6_forward_kernel(const scalar_t* __restrict__ input,
+                                     scalar_t* __restrict__ output,
+                                     int64_t numel) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= numel) return;
+    scalar_t val = input[idx];
+    val = val < scalar_t(0) ? scalar_t(0) : (val > scalar_t(6) ? scalar_t(6) : val);
+    output[idx] = val;
+}
+
+template <typename scalar_t>
+__global__ void relu6_backward_kernel(const scalar_t* __restrict__ input,
+                                      const scalar_t* __restrict__ grad_output,
+                                      scalar_t* __restrict__ grad_input,
+                                      int64_t numel) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= numel) return;
+    scalar_t in_val = input[idx];
+    scalar_t go     = grad_output[idx];
+    grad_input[idx] = (in_val > scalar_t(0) && in_val < scalar_t(6)) ? go : scalar_t(0);
+}
+
+torch::Tensor relu6_forward_cuda(torch::Tensor input) {
+    auto output = torch::empty_like(input);
+    int64_t numel = input.numel();
+    const int threads = 256;
+    const int blocks  = (numel + threads - 1) / threads;
+
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), "relu6_forward_cuda", ([&] {
+        relu6_forward_kernel<scalar_t><<<blocks, threads>>>(
+            input.data_ptr<scalar_t>(),
+            output.data_ptr<scalar_t>(),
+            numel);
+    }));
+    return output;
+}
+
+torch::Tensor relu6_backward_cuda(torch::Tensor input, torch::Tensor grad_output) {
+    auto grad_input = torch::empty_like(input);
+    int64_t numel = input.numel();
+    const int threads = 256;
+    const int blocks  = (numel + threads - 1) / threads;
+
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), "relu6_backward_cuda", ([&] {
+        relu6_backward_kernel<scalar_t><<<blocks, threads>>>(
+            input.data_ptr<scalar_t>(),
+            grad_output.data_ptr<scalar_t>(),
+            grad_input.data_ptr<scalar_t>(),
+            numel);
+    }));
+    return grad_input;
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("relu6_forward_cuda",  &relu6_forward_cuda,  "ReLU6 forward (CUDA)");
+    m.def("relu6_backward_cuda", &relu6_backward_cuda, "ReLU6 backward (CUDA)");
+}
+"""
+
+cpp_decl = """
+torch::Tensor relu6_forward_cuda(torch::Tensor input);
+torch::Tensor relu6_backward_cuda(torch::Tensor input, torch::Tensor grad_output);
+"""
+
+relu6_cuda = load_inline(
+    name        = "custom_relu6",
+    cpp_sources = cpp_decl,
+    cuda_sources = cuda_source,
+    functions   = ["relu6_forward_cuda", "relu6_backward_cuda"],
+    verbose     = False,
+)
+
+# ---------------------------------------------------------------------------
+# Python autograd wrapper around the CUDA ReLU6 kernel
+# ---------------------------------------------------------------------------
+
+class _ReLU6Function(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input):
+        ctx.save_for_backward(input)
+        return relu6_cuda.relu6_forward_cuda(input)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (input,) = ctx.saved_tensors
+        return relu6_cuda.relu6_backward_cuda(input, grad_output)
+
+class CustomReLU6(nn.Module):
+    def forward(self, x):
+        return _ReLU6Function.apply(x)
+
+# ---------------------------------------------------------------------------
+# Optimised EfficientNet-B1 model that uses the custom ReLU6
+# ---------------------------------------------------------------------------
+
+class ModelNew(nn.Module):
+    def __init__(self, num_classes=1000):
+        super().__init__()
+
+        # Initial convolutional stem
+        self.conv1 = nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1, bias=False)
+        self.bn1   = nn.BatchNorm2d(32)
+
+        # MBConv stages
+        self.mbconv1 = self._make_mbconv_block( 32,  16, stride=1, expand_ratio=1)
+        self.mbconv2 = self._make_mbconv_block( 16,  24, stride=2, expand_ratio=6)
+        self.mbconv3 = self._make_mbconv_block( 24,  40, stride=2, expand_ratio=6)
+        self.mbconv4 = self._make_mbconv_block( 40,  80, stride=2, expand_ratio=6)
+        self.mbconv5 = self._make_mbconv_block( 80, 112, stride=1, expand_ratio=6)
+        self.mbconv6 = self._make_mbconv_block(112, 192, stride=2, expand_ratio=6)
+        self.mbconv7 = self._make_mbconv_block(192, 320, stride=1, expand_ratio=6)
+
+        # Head
+        self.conv2 = nn.Conv2d(320, 1280, kernel_size=1, stride=1, padding=0, bias=False)
+        self.bn2   = nn.BatchNorm2d(1280)
+
+        # Classification layer
+        self.fc    = nn.Linear(1280, num_classes)
+
+    def _make_mbconv_block(self, in_ch, out_ch, stride, expand_ratio):
+        hidden_dim = round(in_ch * expand_ratio)
+        return nn.Sequential(
+            nn.Conv2d(in_ch, hidden_dim, kernel_size=1, stride=1, padding=0, bias=False),
+            nn.BatchNorm2d(hidden_dim),
+            CustomReLU6(),
+
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, stride=stride, padding=1,
+                      groups=hidden_dim, bias=False),
+            nn.BatchNorm2d(hidden_dim),
+            CustomReLU6(),
+
+            nn.Conv2d(hidden_dim, out_ch, kernel_size=1, stride=1, padding=0, bias=False),
+            nn.BatchNorm2d(out_ch),
+        )
+
+    def forward(self, x):
+        # Stem
+        x = F.relu(self.bn1(self.conv1(x)))
+
+        # MBConv stages
+        x = self.mbconv1(x)
+        x = self.mbconv2(x)
+        x = self.mbconv3(x)
+        x = self.mbconv4(x)
+        x = self.mbconv5(x)
+        x = self.mbconv6(x)
+        x = self.mbconv7(x)
+
+        # Head
+        x = F.relu(self.bn2(self.conv2(x)))
+
+        # Pool & FC
+        x = F.adaptive_avg_pool2d(x, (1, 1))
+        x = torch.flatten(x, 1)
+        x = self.fc(x)
+        return x
+
+────────────────────────────────────────
+Main Critical Problem
+────────────────────────────────────────
+critical_issue: Duplicate PYBIND11_MODULE definition in cpp and cu
+why_it_matters: Linker emits multiple-symbol error, build aborts; custom ReLU6 never loads, so model cannot execute at all.
+minimal_fix_hint: Keep PYBIND11_MODULE in one file
+
+```python
+# <your corrected code>
+```
+# ==========================================================

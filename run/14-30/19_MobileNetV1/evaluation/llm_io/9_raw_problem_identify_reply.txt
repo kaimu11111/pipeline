@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Backward kernel reads non-contiguous input as contiguous",
+  "why_it_matters": "ctx saves original x; kernel flat-indexes it, so for strided tensors gradients are computed from wrong memory, diverging from PyTorch.",
+  "minimal_fix_hint": "save x.contiguous() or make input.contiguous() before backward"
+}
+```

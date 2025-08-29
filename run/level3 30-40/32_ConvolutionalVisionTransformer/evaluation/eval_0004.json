@@ -1,0 +1,6 @@
+{
+  "runnable": false,
+  "phase": "repair",
+  "error_type": "RuntimeError",
+  "message": "Traceback (most recent call last):\n  File \"/home/wan00559/pipleline/utils/compile_and_run.py\", line 516, in compare_and_bench\n    test_model = ModelNew(*init_args, **init_kwargs)\n                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nTypeError: ModelNew.__init__() takes 2 positional arguments but 4 were given\n"
+}

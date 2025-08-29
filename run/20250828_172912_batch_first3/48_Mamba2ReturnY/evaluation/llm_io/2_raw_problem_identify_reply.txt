@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "CUDA segsum omits the jth element (off-by-one)",
+  "why_it_matters": "Kernel sums k=j+1…i while PyTorch’s cumsum difference includes k=j, shifting every exponential weight and distorting Y_diag outputs (~6e4 max error).",
+  "minimal_fix_hint": "start loop at k=j, not j+1"
+}
+```

@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Duplicate PYBIND11_MODULE symbol in cuda & auto-wrapper",
+  "why_it_matters": "Linker reports multiple definition of PyInit_effnet_custom_ops, the extension fails to build, model cannot execute.",
+  "minimal_fix_hint": "Remove manual PYBIND11_MODULE or disable auto wrapper"
+}
+```

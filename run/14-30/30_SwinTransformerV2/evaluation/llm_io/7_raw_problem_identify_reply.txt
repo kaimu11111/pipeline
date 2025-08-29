@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "DropPath stochastic depth used but reference disables it",
+  "why_it_matters": "Randomly dropping residual paths alters activations every run; reference always keeps paths, so outputs diverge significantly.",
+  "minimal_fix_hint": "Replace DropPath with nn.Identity or set drop_prob=0."
+}
+```

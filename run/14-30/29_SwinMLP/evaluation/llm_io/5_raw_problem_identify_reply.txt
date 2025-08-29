@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "CUDA window ops have no autograd support",
+  "why_it_matters": "Reference partition/reverse are view ops with full gradient flow; custom kernels return tensors with grad_fn=None, breaking back-prop.",
+  "minimal_fix_hint": "Implement torch::autograd::Function with backward kernels"
+}
+```

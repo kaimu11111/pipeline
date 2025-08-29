@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "get_init_inputs returns undefined hidden_layer_sizes",
+  "why_it_matters": "Raises NameError during model construction, preventing any forward pass and breaking correctness entirely.",
+  "minimal_fix_hint": "define hidden_layer_sizes or use layer_sizes in get_init_inputs"
+}
+```

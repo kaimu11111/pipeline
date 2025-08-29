@@ -1,0 +1,5 @@
+task,best_score,best_runnable,task_dir,figure
+KernelBench/temp1/50_ReLUSelfAttention.py,0.104293,1,/home/wan00559/pipleline/run/20250828_191841_50_ReLUSelfAttention/50_ReLUSelfAttention,/home/wan00559/pipleline/run/20250828_191841_50_ReLUSelfAttention/50_ReLUSelfAttention/figures/50_ReLUSelfAttention_score.png
+
+avg_speedup,0.104293
+accuracy,1.000000

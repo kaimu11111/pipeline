@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Final Y permute swaps chunk-len order",
+  "why_it_matters": "Y is reshaped with (l,c) not (c,l); for >1 chunks sequence elements misordered, giving large output errors.",
+  "minimal_fix_hint": "Replace permute(0,2,1,3,4) with no permute before reshape."
+}
+```

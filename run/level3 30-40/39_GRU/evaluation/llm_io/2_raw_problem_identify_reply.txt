@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "CUDA file redeclares PYBIND11_MODULE, duplicating auto-generated one",
+  "why_it_matters": "Two PyInit_fused_gru_cell symbols clash at link time, extension fails to build so model cannot run at all.",
+  "minimal_fix_hint": "Delete PYBIND11_MODULE block in cuda.cu"
+}
+```

@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Obsolete macro AT_DISPATCH_ALL_TYPES_AND_HALF used",
+  "why_it_matters": "Macro no longer exists in current PyTorch headers, so CUDA extension fails to compile and model cannot execute.",
+  "minimal_fix_hint": "Replace with valid dispatch macro, e.g. AT_DISPATCH_ALL_TYPES."
+}
+```

@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "_segsum_ref includes x_j term (inclusive sum)",
+  "why_it_matters": "Decay_chunk uses this wrong segment-sum, giving incorrect inter-chunk decay factors and large output drift.",
+  "minimal_fix_hint": "replace shifted trick with cumsum[..., :,None]-cumsum[...,None,:]"
+}
+```

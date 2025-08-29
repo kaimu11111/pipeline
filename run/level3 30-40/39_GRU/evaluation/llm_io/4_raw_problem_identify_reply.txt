@@ -1,0 +1,5 @@
+{
+  "critical_issue": "Uses independent weight initialization, not PyTorch GRU’s parameters",
+  "why_it_matters": "Candidate randomly re-initializes weights (Xavier/orthogonal) instead of copying reference GRU weights, so even identical inputs produce unrelated activations.",
+  "minimal_fix_hint": "Load/assign nn.GRU parameters into custom model"
+}

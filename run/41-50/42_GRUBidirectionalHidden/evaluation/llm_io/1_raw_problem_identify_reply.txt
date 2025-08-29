@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "AT_DISPATCH_ALL_TYPES_AND_HALF undefined in .cu file",
+  "why_it_matters": "Kernel compilation fails, so the custom identity op and therefore the whole ModelNew cannot run at all.",
+  "minimal_fix_hint": "include <ATen/Dispatch.h> (or proper dispatch header)"
+}
+```

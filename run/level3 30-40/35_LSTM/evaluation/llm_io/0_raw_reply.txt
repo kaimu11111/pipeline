@@ -1,0 +1,143 @@
+```python
+import math
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# ------------------------------------------------------------------
+# Custom CUDA implementation of a fused Linear (matmul + bias) layer
+# ------------------------------------------------------------------
+cuda_source = r"""
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+__global__ void linear_forward_kernel(
+    const float* __restrict__ input,
+    const float* __restrict__ weight,
+    const float* __restrict__ bias,
+    float* __restrict__ output,
+    int batch_size,
+    int in_features,
+    int out_features)
+{
+    int out_id = blockIdx.x * blockDim.x + threadIdx.x;   // output feature index
+    int batch_id = blockIdx.y;                            // batch index
+
+    if (out_id >= out_features || batch_id >= batch_size)
+        return;
+
+    const float* w_row = weight + out_id * in_features;
+    const float* in_ptr = input + batch_id * in_features;
+
+    float sum = 0.f;
+    for (int i = 0; i < in_features; ++i)
+        sum += w_row[i] * in_ptr[i];
+
+    output[batch_id * out_features + out_id] = sum + bias[out_id];
+}
+
+torch::Tensor linear_cuda(torch::Tensor input,
+                          torch::Tensor weight,
+                          torch::Tensor bias) {
+    TORCH_CHECK(input.is_cuda(),  "input must be CUDA");
+    TORCH_CHECK(weight.is_cuda(), "weight must be CUDA");
+    TORCH_CHECK(bias.is_cuda(),   "bias must be CUDA");
+
+    TORCH_CHECK(input.dtype() == torch::kFloat32,  "only float32 supported");
+    TORCH_CHECK(weight.dtype() == torch::kFloat32, "only float32 supported");
+    TORCH_CHECK(bias.dtype() == torch::kFloat32,   "only float32 supported");
+
+    input  = input.contiguous();
+    weight = weight.contiguous();
+    bias   = bias.contiguous();
+
+    const int batch_size   = input.size(0);
+    const int in_features  = input.size(1);
+    const int out_features = weight.size(0);
+
+    auto output = torch::empty({batch_size, out_features},
+                               input.options());
+
+    constexpr int THREADS = 256;
+    const int blocks_x = (out_features + THREADS - 1) / THREADS;
+    const dim3 grid(blocks_x, batch_size);
+
+    linear_forward_kernel<<<grid, THREADS>>>(
+        input.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        in_features,
+        out_features);
+
+    return output;
+}
+"""
+
+cpp_signature = "torch::Tensor linear_cuda(torch::Tensor input, torch::Tensor weight, torch::Tensor bias);"
+
+linear_cuda_module = load_inline(
+    name="custom_linear_cuda",
+    cpp_sources=cpp_signature,
+    cuda_sources=cuda_source,
+    functions=["linear_cuda"],
+    verbose=False,
+)
+
+# ----------------------------------
+# PyTorch wrapper for the CUDA kernel
+# ----------------------------------
+class CustomLinear(nn.Module):
+    def __init__(self, in_features, out_features):
+        super().__init__()
+        self.in_features  = in_features
+        self.out_features = out_features
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        self.bias   = nn.Parameter(torch.empty(out_features))
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        fan_in = self.in_features
+        bound = 1 / math.sqrt(fan_in)
+        nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x):
+        # Fall back to torch.nn.functional.linear if tensor is on CPU
+        if not x.is_cuda:
+            return torch.nn.functional.linear(x, self.weight, self.bias)
+        return linear_cuda_module.linear_cuda(x, self.weight, self.bias)
+
+# ---------------------------
+# Optimised LSTM-based model
+# ---------------------------
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers, output_size, dropout=0.0):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_layers  = num_layers
+
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers,
+                            batch_first=True, dropout=dropout, bidirectional=False)
+        self.fc = CustomLinear(hidden_size, output_size)
+
+    def forward(self, x, h0=None, c0=None):
+        batch_size = x.size(0)
+
+        if h0 is None:
+            h0 = torch.randn(self.num_layers, batch_size, self.hidden_size,
+                             device=x.device, dtype=x.dtype)
+        if c0 is None:
+            c0 = torch.randn(self.num_layers, batch_size, self.hidden_size,
+                             device=x.device, dtype=x.dtype)
+
+        # LSTM forward
+        out, _ = self.lstm(x, (h0, c0))  # (batch, seq_len, hidden_size)
+
+        # Take the last time step and apply the custom Linear layer
+        out_last = out[:, -1, :]          # (batch, hidden_size)
+        out      = self.fc(out_last)      # (batch, output_size)
+        return out
+```

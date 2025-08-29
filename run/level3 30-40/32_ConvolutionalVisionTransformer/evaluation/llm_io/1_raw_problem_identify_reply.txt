@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Duplicate PYBIND11_MODULE definition",
+  "why_it_matters": "Linker raises multiple-definition error, extension fails to compile, model cannot run or match reference output.",
+  "minimal_fix_hint": "Delete module macro from cuda_src"
+}
+```

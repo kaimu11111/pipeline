@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "fc1 in_features fixed at 256*6*6 but conv output is 256*2*2 for 112×112 input",
+  "why_it_matters": "Shape mismatch (9216 vs 1024) causes Linear matmul runtime error, halting forward pass and breaking parity with reference.",
+  "minimal_fix_hint": "Compute fc1 in_features dynamically (256*2*2) or adapt layer to input size."
+}
+```

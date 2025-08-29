@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "getCurrentCUDAStream used without including CUDAContext header",
+  "why_it_matters": "Extension fails to compile, so custom ReLU and entire model cannot run, diverging completely from reference behavior.",
+  "minimal_fix_hint": "add #include <ATen/cuda/CUDAContext.h>"
+}
+```

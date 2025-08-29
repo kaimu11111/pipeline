@@ -1,0 +1,17 @@
+task,best_score,best_runnable,task_dir,figure
+KernelBench/level3test/10_ResNet101.py,0.901185,1,/home/wan00559/pipleline/run/20250828_154447_batch_first13/10_ResNet101,/home/wan00559/pipleline/run/20250828_154447_batch_first13/10_ResNet101/figures/10_ResNet101_score.png
+KernelBench/level3test/11_VGG16.py,1.041333,1,/home/wan00559/pipleline/run/20250828_154447_batch_first13/11_VGG16,/home/wan00559/pipleline/run/20250828_154447_batch_first13/11_VGG16/figures/11_VGG16_score.png
+KernelBench/level3test/12_VGG19.py,0.587440,1,/home/wan00559/pipleline/run/20250828_154447_batch_first13/12_VGG19,/home/wan00559/pipleline/run/20250828_154447_batch_first13/12_VGG19/figures/12_VGG19_score.png
+KernelBench/level3test/13_DenseNet121TransitionLayer.py,0.651139,1,/home/wan00559/pipleline/run/20250828_154447_batch_first13/13_DenseNet121TransitionLayer,/home/wan00559/pipleline/run/20250828_154447_batch_first13/13_DenseNet121TransitionLayer/figures/13_DenseNet121TransitionLayer_score.png
+KernelBench/level3test/1_MLP.py,0.859647,1,/home/wan00559/pipleline/run/20250828_154447_batch_first13/1_MLP,/home/wan00559/pipleline/run/20250828_154447_batch_first13/1_MLP/figures/1_MLP_score.png
+KernelBench/level3test/2_ShallowWideMLP.py,0.000000,0,/home/wan00559/pipleline/run/20250828_154447_batch_first13/2_ShallowWideMLP,/home/wan00559/pipleline/run/20250828_154447_batch_first13/2_ShallowWideMLP/figures/2_ShallowWideMLP_score.png
+KernelBench/level3test/3_DeepNarrowMLP.py,0.486419,1,/home/wan00559/pipleline/run/20250828_154447_batch_first13/3_DeepNarrowMLP,/home/wan00559/pipleline/run/20250828_154447_batch_first13/3_DeepNarrowMLP/figures/3_DeepNarrowMLP_score.png
+KernelBench/level3test/4_LeNet5.py,1.173353,1,/home/wan00559/pipleline/run/20250828_154447_batch_first13/4_LeNet5,/home/wan00559/pipleline/run/20250828_154447_batch_first13/4_LeNet5/figures/4_LeNet5_score.png
+KernelBench/level3test/5_AlexNet.py,0.000000,0,/home/wan00559/pipleline/run/20250828_154447_batch_first13/5_AlexNet,/home/wan00559/pipleline/run/20250828_154447_batch_first13/5_AlexNet/figures/5_AlexNet_score.png
+KernelBench/level3test/6_GoogleNetInceptionModule.py,1.063838,1,/home/wan00559/pipleline/run/20250828_154447_batch_first13/6_GoogleNetInceptionModule,/home/wan00559/pipleline/run/20250828_154447_batch_first13/6_GoogleNetInceptionModule/figures/6_GoogleNetInceptionModule_score.png
+KernelBench/level3test/7_GoogleNetInceptionV1.py,0.918425,1,/home/wan00559/pipleline/run/20250828_154447_batch_first13/7_GoogleNetInceptionV1,/home/wan00559/pipleline/run/20250828_154447_batch_first13/7_GoogleNetInceptionV1/figures/7_GoogleNetInceptionV1_score.png
+KernelBench/level3test/8_ResNetBasicBlock.py,1.031631,1,/home/wan00559/pipleline/run/20250828_154447_batch_first13/8_ResNetBasicBlock,/home/wan00559/pipleline/run/20250828_154447_batch_first13/8_ResNetBasicBlock/figures/8_ResNetBasicBlock_score.png
+KernelBench/level3test/9_ResNet18.py,0.967647,1,/home/wan00559/pipleline/run/20250828_154447_batch_first13/9_ResNet18,/home/wan00559/pipleline/run/20250828_154447_batch_first13/9_ResNet18/figures/9_ResNet18_score.png
+
+avg_speedup,0.744774
+accuracy,0.846154

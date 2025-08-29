@@ -1,0 +1,140 @@
+
+You write custom CUDA kernels to replace the pytorch operators in the given architecture 
+to get speedups.You have complete freedom to choose the set of operators you want to replace. You may
+make the decision to replace some operators with custom CUDA kernels and leave others
+unchanged. You may replace multiple operators with custom implementations, consider
+operator fusion opportunities (combining multiple operators into a single kernel, for
+example, combining matmul+relu), or algorithmic changes (such as online softmax). You are
+only limited by your imagination.
+
+Here\’s an example to show you the syntax of inline embedding custom CUDA operators in torch: 
+The example given architecture is:
+‘‘‘
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class Model(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, a, b):
+        return a + b
+
+
+def get_inputs():
+    # randomly generate input tensors based on the model architecture
+    a = torch.randn(1, 128).cuda()
+    b = torch.randn(1, 128).cuda()
+    return [a, b]
+
+
+def get_init_inputs():
+    # randomly generate tensors required for initialization based on the model architecture
+    return []
+‘‘‘
+The example new arch with custom CUDA kernels looks like this:
+‘‘‘
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for element-wise addition
+source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void elementwise_add_kernel(const float* a, const float* b, float* out, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        out[idx] = a[idx] + b[idx];
+    }
+}
+
+torch::Tensor elementwise_add_cuda(torch::Tensor a, torch::Tensor b) {
+    auto size = a.numel();
+    auto out = torch::zeros_like(a);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    elementwise_add_kernel<<<num_blocks, block_size>>>(a.data_ptr<float>(), b.data_ptr<float>(), out.data_ptr<float>(), size);
+
+    return out;
+}
+"""
+
+cpp_src = (
+    "torch::Tensor elementwise_add_cuda(torch::Tensor a, torch::Tensor b);"
+)
+
+# Compile the inline CUDA code for element-wise addition
+elementwise_add = load_inline(
+    name="elementwise_add",
+    cpp_sources=cpp_src,
+    cuda_sources=source,
+    functions=["elementwise_add_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.elementwise_add = elementwise_add
+
+    def forward(self, a, b):
+        return self.elementwise_add.elementwise_add_cuda(a, b)
+‘‘‘
+
+You are given the following architecture:
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class Model(nn.Module):
+    def __init__(self, embed_dim, num_heads):
+        """
+        Attention Block using Multihead Self-Attention.
+        :param embed_dim: Embedding dimension (the number of channels)
+        :param num_heads: Number of attention heads
+        """
+        super(Model, self).__init__()
+        self.attn = nn.MultiheadAttention(embed_dim, num_heads)
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, x):
+        """
+        Forward pass of the AttentionBlock.
+        :param x: Input tensor of shape (B, C, H, W)
+        :return: Output tensor of the same shape (B, C, H, W)
+        """
+        B, C, H, W = x.shape
+        x = x.view(B, C, H * W).permute(2, 0, 1)  # (seq_len, batch_size, embed_dim)
+        attn_output, _ = self.attn(x, x, x)
+        x = self.norm(attn_output + x)  # (seq_len, batch_size, embed_dim)
+        x = x.permute(1, 2, 0).view(B, C, H, W)
+        return x
+
+embed_dim = 64
+num_heads = 4
+batch_size = 2
+num_channels = embed_dim
+image_height = 64
+image_width = 64
+
+def get_inputs():
+    return [torch.rand(batch_size, num_channels, image_height, image_width)]
+
+def get_init_inputs():
+    return [embed_dim, num_heads]
+```
+Optimize the architecture named Model with custom CUDA operators! Name your optimized
+output architecture ModelNew. Output the new code in codeblocks. Please generate real
+code, NOT pseudocode, make sure the code compiles and is fully functional. Just output
+the new model code, no other text, and NO testing code!

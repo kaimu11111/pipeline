@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "CUDAReLU lacks inplace argument but called as relu(inplace=False)",
+  "why_it_matters": "Model construction raises TypeError, preventing any forward pass and producing no outputs compared to reference model.",
+  "minimal_fix_hint": "Add __init__(self, inplace=False): pass"
+}
+```
